@@ -1,0 +1,2196 @@
+---
+title: "Ledenev_Midterm"
+author: "VLedenev"
+output: 
+    html_document:
+           toc: TRUE
+           toc_float:
+                collapsed: TRUE
+                smooth_scroll: TRUE
+           toc_depth: 3
+           number_sections: FALSE
+date: "2023-10-23"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(ggplot2)
+library(naniar)
+library(missForest)
+library(beepr)
+library(sjPlot)
+library(car)
+library(gmodels)
+library(MASS)
+library(quantreg)
+library(gtsummary)
+options(scipen = 999)
+```
+
+### Описание предполагаемого проекта
+
+## Основная идея
+Поскольку социология счастья не входит в предмет моих интересов, а проект хотелось бы делать с интересом, я решил проверить, насколько Россия - страна возможностей. Для этого я далее проверяю связь между удовлетворенностью финансовым положением и различными факторами, определяющими ориентацию индивида на увеличение собственного дохода.
+Мы целенаправленно не включаем уровень дохода, уточняемый в рамках WVS, поскольку это меняет "исследовательский" вопрос. Меня интересует, оказались ли люди **субъективно** довольны результатами своего вложения сил в увеличение дохода. Какой у них действительно доход при этом неважно.
+
+## Содержательные предикторы
+
+В качестве предикторов мы предполагаем использовать следующие переменные из WVS 2017:
+# Прокси важности труда как ценности
+(1) Q9 Important child qualities
+(2) Q41 Work should always come first even if it means less spare
+time
+# Прокси хард скиллз
+(3) Q275 Highest educational level: Respondent [ISCED 2011]
+# Прокси софт скиллз
+(4) Q61 Trust: People you meet for the first time (как готовность наращивать социальный капитал)
+# Прокси внутреннего локуса контроля
+(5) Q108 Government´s vs individual´s responsibility
+# Прокси готовности к оппортунистическому поведению для заработка
+(6) Q178 Justifiable: Avoiding a fare on public transport
+
+## Содержательно-контрольные предикторы
+В качестве предикторов, которые одновременно являются необходимыми контрольными переменными мы планируем использовать следующие переменные из WVS 2017:
+(6) Q279 Employment status
+(7) Q273 Marital status
+(8) Q274 How many children do you have
+
+## Контрольные предикторы
+(9) Age / Birth after 1987 
+(10) Q260 Sex
+
+
+### Загрузка данных
+
+```{r}
+
+wvs <- fread("/Users/viktorledenev/Desktop/EU - courses/Kolich - 2/Midterm/WVS_Cross-National_Wave_7_csv_v5_0.csv")
+russ_wvs <- wvs[B_COUNTRY == 643, ]
+
+# clean up
+rm(wvs)
+```
+
+
+### Подготовка к дескриптивной стадии
+
+```{r}
+russ_wvs <- russ_wvs[, .(finance_satisfaction = Q50, hardwork_important = Q9, hardwork_over_leisure = Q41, perseverance_important = Q14, trust_to_nonames = Q61, education = Q275, sex = Q260, age = Q262, marital_status = Q273, child_number = Q274, job_status = Q279, weights = W_WEIGHT, id = D_INTERVIEW, year_of_birth = Q261, ind_vs_gov_responsible = Q108, freerid_just = Q178)]
+
+# Перекодируем -1 и -2 в NA, которыми они являются.
+russ_wvs <- russ_wvs[,  lapply(.SD, function (x) ifelse ((x == -1 | x == -2), NA, x))]
+
+
+# revert trust_to_nonames
+russ_wvs[, trust_to_nonames := 5 - trust_to_nonames] 
+russ_wvs[, hardwork_over_leisure := 6 - hardwork_over_leisure] 
+
+# recode as factor prior to descriptive stage
+russ_wvs[, c("hardwork_important", "hardwork_over_leisure", "perseverance_important", "trust_to_nonames", "education", "sex", "marital_status", "job_status") := lapply(.SD, as.factor), .SDcols = c("hardwork_important", "hardwork_over_leisure", "perseverance_important", "trust_to_nonames", "education", "sex", "marital_status", "job_status")]
+
+```
+
+### Проверка распределений
+
+```{r}
+ggplot(russ_wvs, aes(x = finance_satisfaction)) + 
+  geom_histogram(binwidth = 0.5)
+prop.table(table(russ_wvs$finance_satisfaction))*100 
+quantile(russ_wvs$finance_satisfaction, probs = c(seq(0, 1, by = 0.1)), na.rm = T)
+```
+
+Распределение слегка скошено влево. Нет смысла бинаризовывать. Оставим
+integer. Есть небольшая доля NA (отрицательные значения).
+
+```{r}
+ggplot(russ_wvs, aes(x = hardwork_important)) + 
+  geom_bar()
+prop.table(table(russ_wvs$hardwork_important))*100
+
+# Перекодируем в более традиционную бинарную форму
+russ_wvs[is.na(hardwork_important) == F, hardwork_important := as.factor(fifelse(hardwork_important == 1, 1, 0))]
+```
+
+Порядка 3/4 респондентов полагает, что оценивают трудолюбие как
+качество, которое следует прививать детям. Двухуровневость ответа
+отчасти цензурирует ответы, однако вопрос все еще лучше альтернативных
+прокси трудолюбия а-ля пятиуровневый Q39 People who don´t work turn
+lazy, которые скорее оценивает цели труда, а не важность трудолюбия.
+
+```{r}
+ggplot(russ_wvs, aes(x = hardwork_over_leisure)) + 
+  geom_bar()
+prop.table(table(russ_wvs$hardwork_over_leisure))*100
+```
+
+Отношение к приоритету труда над отдыхом имеет +- нормальное
+распределение. =\> Можно кодировать в качестве нумерика для целей
+регрессионного анализа (в идеале было бы бинаризовать, но средний
+вариант, 3, не распределить для бинаризации равномерно).] Сделаем это
+после заполнения миссингов, чтобы missForest не беспокоился.
+
+```{r}
+ggplot(russ_wvs, aes(x = perseverance_important)) + 
+  geom_bar()
+prop.table(table(russ_wvs$perseverance_important))*100
+
+# Перекодируем в более традиционную бинарную форму
+russ_wvs[is.na(perseverance_important) == F, perseverance_important := as.factor(fifelse(perseverance_important == 1, 1, 0))]
+```
+
+6/4 - признание неважности/важности напористости. Оставим
+бинаризованной. Отчасти цензурированной, но альтернативы у нас нет.
+
+```{r}
+ggplot(russ_wvs, aes(x = trust_to_nonames)) + 
+  geom_bar()
+prop.table(table(russ_wvs$trust_to_nonames))*100
+
+russ_wvs[is.na(trust_to_nonames) == F, trust_to_nonames := as.factor(fifelse(trust_to_nonames == 3 | trust_to_nonames == 4, 1, 0))]
+```
+
+Распределение явно скошено в пользу недоверия незнакомцам. В этой связи
+делать numeric переменную нежелательно В этой связи мы бинаризуем по
+принципу доверяет/не доверяет.
+
+```{r}
+ggplot(russ_wvs, aes(x = education)) + 
+  geom_bar()
+prop.table(table(russ_wvs$education))*100
+sum(prop.table(table(russ_wvs$education))[1:6]*100)
+```
+
+66.4% без высшего образования. Остальные с ним. 2% с бакалавриатом. 30%
+с магистратурой или, видимо, специалитетом
+(<https://issek.hse.ru/news/118000774.html>). Хотя было бы интереснее
+разделить специалитет и магистратуру. Такое цензурирование не дает
+разделить тех, кто решил предпочесть образование опыту работы.
+
+Поделим для простоты интерпретации в будущем по принципу есть/нет
+высшего образования. С учетом нашего исследовательского вопроса наличие
+высшего образования достаточный индикатор хард-скиллов.
+
+```{r}
+ggplot(russ_wvs, aes(x = sex)) + 
+  geom_bar()
+prop.table(table(russ_wvs$sex))*100
+
+russ_wvs[is.na(sex) == F, sex := as.factor(fifelse(sex == 2, "Fem", "Male"))]
+```
+
+59% женщин. 41% мужчин.
+
+```{r}
+ggplot(russ_wvs, aes(x = age)) + 
+  geom_histogram(binwidth = 0.5)
+# prop.table(table(russ_wvs$age))*100
+quantile(russ_wvs$age, probs = c(seq(0, 1, by = 0.1)), na.rm = T)
+mean(russ_wvs$age)
+```
+
+Возраст немного скошен вправо.
+
+```{r}
+ggplot(russ_wvs, aes(x = marital_status)) + 
+  geom_bar()
+prop.table(table(russ_wvs$marital_status))*100
+
+russ_wvs[is.na(marital_status) == F, marriage_history := as.factor(fifelse(marital_status == 2 | marital_status == 6, 0, 1))]
+
+russ_wvs[, marital_status := NULL]
+
+prop.table(table(russ_wvs$marriage_history))*100
+
+```
+
+Переменная очень разнообразная. Ее кодировка зависит от
+исследовательского вопроса. В этой связи самый простой вариант был/не
+был в браке или одинок/ (был) не одинок. Ответ single в контексте других
+ответов звучит как "одинок в данный момент, брака не имел (иначе бы
+сказал, что Divorced), но отношения могли бы быть". Не очень ясно, куда
+относятся Living together as married, которые Divorced или Widowed.
+Наибольшей содержательной чистотой, видимо, будет обладает деление по
+принципу был/не был в браке, поэтому воспользуемся им. Хотя это
+полностью и не демонстрирует нашу мысль о том, что полноценные отношения
+сложно совмещать с работой и обучением.
+
+```{r}
+ggplot(russ_wvs, aes(x = child_number)) + 
+  geom_bar() +
+  scale_x_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9))
+prop.table(table(russ_wvs$child_number))*100
+
+russ_wvs[is.na(child_number) == F, child_number_factor := as.factor(fifelse(child_number == 0, "0", 
+                                                                    fifelse(child_number == 1, "1", 
+                                                                            fifelse(child_number == 2, "2", "3+"))))]
+
+russ_wvs[, child_number := NULL]
+```
+
+Около четверти не имеют детей. Около 10% имеют трех и более. 35% с одним
+ребенком. 27% с двумя детьми. С учетом нашего исследовательского вопроса
+и нагруженности категорий значениями поделим по принципу не имеет детей
+(строго прокарьерный вариант) / имеет нижнее "среднее" число детей (1)
+(умеренно прокарьерный вариант) / имеет верхнее "среднее" число детей
+(2) (неясный вариант) / имеет много детей (3+) (некарьерный вариант).
+
+```{r}
+ggplot(russ_wvs, aes(x = job_status)) + 
+  geom_bar()
+prop.table(table(russ_wvs$job_status))*100
+
+russ_wvs[is.na(job_status) == F, job_career_oriented := as.factor(fifelse(job_status == 1 | job_status == 3 | job_status == 6, 1, 0))]
+
+russ_wvs[, job_status := NULL]
+
+prop.table(table(russ_wvs$job_career_oriented))*100
+```
+
+Данные немного цензурированы. Можно быть и студентом/пенсионером, и
+работающим одновременно. Вариант про пенсионеров сформулирован как
+retired/pensioned, то есть как "в отставке/на пенсии". Это еще дает
+основания предположить, что для пенсионеров вопрос сформулирован
+однозначно (кажется, работающий не скажет, что он "на пенсии").
+
+Со студентами этого нет. Тем не менее отнесем студентов по ответу к
+карьерно-ориентированным, а тех, кто ответил про полную или частичную
+занятость, будучи студентов, не будем относить к
+карьерно-ориентированным. Россия - страна возможностей (возможно), но
+никто не сказал, что равных.
+
+54% работающих на полную ставку. 4.6% студентов. 1% самозанятых. Поделим
+по этой линии на возможных карьеристов и нет.
+
+```{r}
+# Предположим, что детсадовский возраст - возраст, с которого ребенок начинает впитывать ценности из внешнего мира => грязные капиталистические ценности начинают прививаться безальтернативно для тех, кто родился в 1987.
+
+russ_wvs[, post_soviet_child := fifelse(year_of_birth >= 1987, 1, 0)]
+russ_wvs[, post_soviet_child := as.factor(post_soviet_child)]
+russ_wvs[, year_of_birth := NULL]
+
+ggplot(russ_wvs, aes(x = post_soviet_child)) + 
+  geom_bar()
+prop.table(table(russ_wvs$post_soviet_child))*100
+```
+
+Постсоветских детей около четверти.
+
+```{r}
+ggplot(russ_wvs, aes(x = ind_vs_gov_responsible)) + 
+  geom_bar()
+prop.table(table(russ_wvs$ind_vs_gov_responsible))*100
+```
+
+Бимодальное распределение с уклоном в государственный патернализм и
+баланс между госпатернализмом/персональной ответственностью. Нумерик не
+совсем был бы удачен из-за неравномерности категорий, но распределение
+не позволяет разложить на более равномерные и осмысленные уровни.
+
+```{r}
+ggplot(russ_wvs, aes(x = freerid_just)) + 
+  geom_bar()
+prop.table(table(russ_wvs$freerid_just))*100
+```
+
+Мы видим одну ярко выраженную моду (нельзя никогда ездить зайцем) и два
+менее ярко выраженных превалирующих значения: центристское отношение и
+полностью оправдывающее значение.
+
+Нумерик не совсем был бы удачен из-за неравномерности категорий, но
+распределение не позволяет разложить на более равномерные и осмысленные
+уровни.
+
+### Проверка на миссинги
+
+```{r}
+vis_miss(russ_wvs)
+```
+
+Заметные пропуски по сензитивным вопросам =\> видимо, не MCAR.
+
+```{r}
+print(mcar_test(russ_wvs)) 
+```
+
+P-value ниже порогового значения =\> Отвергаем гипотезу о MCAR.
+
+С учетом того, что миссинги по сензитивным вопросам, логичнее всего
+осуществить импутацию, а не удалять.
+
+Regression-based импутация слишком громоздкая (необходима разработка
+гипотез) +, кажется, менее точная. KNN не очень подходит для факторов.
+Между Forest-импутацию, поскольку она субъективно кажется удобнее.
+
+```{r}
+setorderv(russ_wvs, c("id"), c("1"))
+
+set.seed(100)
+imputed_tree = missForest(russ_wvs[, .SD, .SDcols =-c("id","weights")], verbose = TRUE)
+```
+
+```{r}
+# Проверим адекватность импутированных данных
+
+#table(imputed_tree[["ximp"]]$finance_satisfaction)
+table(russ_wvs$finance_satisfaction)
+
+table(imputed_tree[["ximp"]]$hardwork_over_leisure)
+table(russ_wvs$hardwork_over_leisure)
+
+table(imputed_tree[["ximp"]]$trust_to_nonames)
+table(russ_wvs$trust_to_nonames)
+
+table(imputed_tree[["ximp"]]$marriage_history)
+table(russ_wvs$marriage_history)
+
+
+```
+
+Finance satisfaction округлим для последовательности, хотя для нашей
+numeric-кодировки это некритично
+
+### Учет миссингов
+
+```{r}
+imputed_tree[["ximp"]]$id <- russ_wvs$id
+imputed_tree[["ximp"]]$weights <- russ_wvs$weights
+
+# compare_tree
+russ_wvs <- imputed_tree$ximp
+
+# clean up
+rm(imputed_tree)
+
+russ_wvs[, hardwork_over_leisure := as.integer(hardwork_over_leisure)]
+
+russ_wvs[, finance_satisfaction := round(finance_satisfaction, digits = 0)]
+russ_wvs[, ind_vs_gov_responsible := round(ind_vs_gov_responsible, digits = 0)]
+russ_wvs[, freerid_just := round(freerid_just, digits = 0)]
+
+russ_wvs[, has_higher_edu := fifelse(as.character(education) %chin% c("6", "7", "8"), "1", "0")]
+russ_wvs[, education := NULL]
+russ_wvs[, has_higher_edu := as.factor(has_higher_edu)]
+```
+
+### Добавление весов
+
+В качестве переменной весов мы отобрали в самом начале W_WEIGHT, а не
+S018 (Equilibrated weight-1000), поскольку у нас нет необходимости
+уменьшать число наблюдений, так как мы не проводим межстрановые
+сравнения. W_WEIGHT, видимо, и есть веса, которые должны быть S017,
+который в FAQ указаны как стандартные весы по базовым демографическим
+признакам, поскольку W_WEIGHT включены непосредственно перед S018, и для
+S018 использованы W_WEIGHT при создании (FAQ указывал, что S018 создан с
+помощью S017)
+
+### Простые статтесты с визуализацией.
+
+hardwork_important
+
+```{r}
+var.test(finance_satisfaction ~ hardwork_important, data = russ_wvs)
+# p-value above threshold - do not reject that variances of groups are equal => no Welch correction
+t.test(finance_satisfaction ~ hardwork_important, data = russ_wvs, var.equal = T)
+
+ggplot(russ_wvs, aes(x = hardwork_important, y = finance_satisfaction))+
+  geom_boxplot() 
+```
+
+Мы наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением между теми, кто считает важным
+прививать трудолюбие детям и наоборот: средняя удовлетворенность для
+первых ниже
+
+hardwork_over_leisure
+
+```{r}
+cor.test(russ_wvs$finance_satisfaction, russ_wvs$hardwork_over_leisure, method = "pearson")
+
+ggplot(russ_wvs, aes(group = hardwork_over_leisure, y = finance_satisfaction))+
+  geom_boxplot()
+
+russ_wvs[, median(finance_satisfaction), by = hardwork_over_leisure]
+```
+
+Мы не наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением в зависимости от степени
+согласия с утверждением о важности труда над отдыхом. IQR для всех
+одинаков, однако медиана выше для 3 и 4 уровня согласия с
+превалированием труда над отдыха, но не для 5. Судя по этому в 3 и 4
+есть большее "расслоение": у небольшой группы наблюдений с 3 и 4 уровнем
+согласия есть относительно высокий уровень удовлетворенности.
+
+Мы не наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением между теми, кто считает важным
+прививать бережливость детям и наоборот.
+
+perseverance_important
+
+```{r}
+var.test(finance_satisfaction ~ perseverance_important, data = russ_wvs)
+# p-value below threshold - reject that variances of groups are equal => Welch correction
+t.test(finance_satisfaction ~ perseverance_important, data = russ_wvs, var.equal = F)
+
+ggplot(russ_wvs, aes(x = perseverance_important, y = finance_satisfaction))+
+  geom_boxplot()
+```
+
+Мы наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением между теми, кто считает важным
+прививать трудолюбие детям и наоборот: средняя удовлетворенность для
+первых выше.
+
+```{r}
+var.test(finance_satisfaction ~ trust_to_nonames, data = russ_wvs)
+# p-value above threshold - do not reject that variances of groups are equal => no Welch correction
+t.test(finance_satisfaction ~ trust_to_nonames, data = russ_wvs, var.equal = T)
+
+ggplot(russ_wvs, aes(x = trust_to_nonames, y = finance_satisfaction))+
+  geom_boxplot()
+```
+
+Мы наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением между теми, кто склонен доверять
+впервые встреченным людям и наоборот: средняя удовлетворенность для
+первых выше
+
+```{r}
+var.test(finance_satisfaction ~ sex, data = russ_wvs)
+# p-value above threshold - do not reject that variances of groups are equal => no Welch correction
+t.test(finance_satisfaction ~ sex, data = russ_wvs, var.equal = T)
+
+ggplot(russ_wvs, aes(x = sex, y = finance_satisfaction))+
+  geom_boxplot()
+
+prop.table(table(russ_wvs[sex == "Male", ]$finance_satisfaction))*100
+prop.table(table(russ_wvs[sex == "Fem", ]$finance_satisfaction))*100
+```
+
+Мы не наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением между мужчинами и женщинами.
+Однако из графика видно, что у мужчин сильно выше медиана при близком
+IQR. Видимо,у мужчин ярче заметно расслоение в доходах.
+
+age
+
+```{r}
+# Age isn't normally distributed => spearman
+cor.test(russ_wvs$finance_satisfaction, russ_wvs$age, method = "spearman")
+
+ggplot(russ_wvs, aes(group = as.factor(finance_satisfaction), y = age))+
+  geom_boxplot()
+
+mean_age_by_fin_sat <- russ_wvs[, mean(age), by = finance_satisfaction]
+setorderv(mean_age_by_fin_sat, c("finance_satisfaction"), c("-1"))
+plot(mean_age_by_fin_sat)
+```
+
+Мы наблюдаем статистически значимую связь снижения возраста и роста
+финансовой удовлетворенности. Связь не совсем линейная, как видно из
+визуализации, однако при этом средний возраст заметно растет для самой
+высокой степени финансовой удовлетворенности.
+
+ind_vs_gov_responsible
+
+```{r}
+# Ind_vs_gov_responsible isn't normally distributed => spearman
+cor.test(russ_wvs$finance_satisfaction, russ_wvs$ind_vs_gov_responsible, method = "spearman")
+
+ggplot(russ_wvs, aes(x = as.factor(finance_satisfaction), fill = as.factor(ind_vs_gov_responsible)))+
+  geom_bar(position = "fill")
+```
+
+Мы наблюдаем статистически значимую связь возложения ответственности на
+индивида с государства и роста финансовой удовлетворенности. При этом
+эффект, кажется, не совсем линейный, поскольку в последней категории, с
+полной ответственностью индивида,крайние значения учащаются.
+
+freerid_just
+
+```{r}
+# Аreerid_just isn't normally distributed => spearman
+cor.test(russ_wvs$finance_satisfaction, russ_wvs$freerid_just, method = "spearman")
+
+ggplot(russ_wvs, aes(x = as.factor(finance_satisfaction), fill = as.factor(freerid_just)))+
+  geom_bar(position = "fill")
+```
+
+Мы не наблюдаем статистически значимую связь оправданности проезда
+зайцем и роста финансовой удовлетворенности. При этом эффект, кажется,
+не совсем линейный, поскольку в последней категории, с полной
+допустимостью, крайняя неоправданность учащается.
+
+marriage_history
+
+```{r}
+var.test(finance_satisfaction ~ marriage_history, data = russ_wvs)
+# p-value above threshold - do not reject that variances of groups are equal => no Welch correction
+t.test(finance_satisfaction ~ marriage_history, data = russ_wvs, var.equal = T)
+
+ggplot(russ_wvs, aes(x = marriage_history, y = finance_satisfaction))+
+  geom_boxplot()
+```
+
+Мы наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением между теми, кто был в браке и
+наоборот: средняя удовлетворенность для первых ниже.
+
+```{r}
+
+bartlett.test(finance_satisfaction ~ child_number_factor, data = russ_wvs)
+# p-value above threshold do not reject that variances of groups are equal => no Welch 
+summary(aov(finance_satisfaction ~ child_number_factor, data = russ_wvs))
+# significant => need an post hoc
+
+DescTools::PostHocTest(aov(finance_satisfaction ~ child_number_factor, data = russ_wvs), method = "lsd")
+
+ggplot(russ_wvs, aes(x = child_number_factor, y = finance_satisfaction))+
+  geom_boxplot()
+```
+
+Мы наблюдаем статистически значимые разницы в средних значениях
+удовлетворенности финансовым положением в зависимости от числа детей по
+4 категориям. Однако связи незначимы между бездетными и людьми с 1
+ребенком, а также людьми с 3+ и 2 детьми.
+
+job_career_oriented
+
+```{r}
+var.test(finance_satisfaction ~ job_career_oriented, data = russ_wvs)
+# p-value below threshold - reject that variances of groups are equal =>  Welch correction
+t.test(finance_satisfaction ~ job_career_oriented, data = russ_wvs, var.equal = F)
+
+ggplot(russ_wvs, aes(x = job_career_oriented, y = finance_satisfaction))+
+  geom_boxplot()
+```
+
+Мы наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением между теми, кого обозначили
+карьерно-ориентированными (фул-тайм, студенты, самозанятые) и наоборот:
+средняя удовлетворенность для первых выше
+
+post_soviet_child
+
+```{r}
+var.test(finance_satisfaction ~ post_soviet_child, data = russ_wvs)
+# p-value below threshold - reject that variances of groups are equal =>  Welch correction
+t.test(finance_satisfaction ~ post_soviet_child, data = russ_wvs, var.equal = F)
+
+ggplot(russ_wvs, aes(x = post_soviet_child, y = finance_satisfaction))+
+  geom_boxplot()
+```
+
+Мы наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением между теми, кто родился после
+1987 года и наоборот: средняя удовлетворенность для первых выше.
+
+has_higher_edu
+
+```{r}
+var.test(finance_satisfaction ~ has_higher_edu, data = russ_wvs)
+# p-value below threshold - reject that variances of groups are equal =>  Welch correction
+t.test(finance_satisfaction ~ has_higher_edu, data = russ_wvs, var.equal = F)
+
+ggplot(russ_wvs, aes(x = has_higher_edu, y = finance_satisfaction))+
+  geom_boxplot()
+```
+
+Мы наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением между теми, у кого есть высшее
+образование и наоборот: средняя удовлетворенность для первых выше.
+
+Мы видим несколько незначимых связей, однако мы предпочтем пока что
+опробовать в регрессионной модели всех из предполагаемых предикторов.
+Во-первых, потому что тесты проводились без поправки на веса. Во-вторых:
+
+2.1. "Мы не наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением в зависимости от степени
+согласия с утверждением о важности труда над отдыхом. Мы наблюдаем
+статистически значимую разницу в средних значениях удовлетворенности
+финансовым положением между теми, кто считает важным прививать
+трудолюбие детям и наоборот: средняя удовлетворенность для первых ниже."
+Такой условно противоречивый результат наводит на мысль, что связь между
+ценностью трудолюбия и финудовлетворенностью может быть.
+
+2.2. Мы не наблюдаем статистически значимую разницу в средних значениях
+удовлетворенности финансовым положением между мужчинами и женщинами. В
+любом случае потребуется как контроль.
+
+### Определим референтные категории.
+
+В наших содержательных, а не контрольных предикторах много факторов, а
+при контроле регрессия использует референтный уровень. В качестве
+референтой контрольной категории будем выбирать условно более
+соответствующую карьерной ориентации. Будем смотреть на "цену"
+"отступления" от нее.
+
+```{r}
+# clean up levels
+russ_wvs[, names(russ_wvs)[sapply(russ_wvs, is.factor)] := lapply(.SD, droplevels), .SDcols = names(russ_wvs)[sapply(russ_wvs, is.factor)]]
+
+russ_wvs[, hardwork_important := relevel(hardwork_important, ref = "1")]
+russ_wvs[, perseverance_important := relevel(perseverance_important, ref = "1")]
+russ_wvs[, trust_to_nonames := relevel(trust_to_nonames, ref = "1")]
+russ_wvs[, sex := relevel(sex, ref = "Male")] # (простите)
+russ_wvs[, marriage_history := relevel(marriage_history, ref = "0")]
+russ_wvs[, child_number_factor := relevel(child_number_factor, ref = "0")]
+russ_wvs[, job_career_oriented := relevel(job_career_oriented, ref = "1")]
+russ_wvs[, post_soviet_child := relevel(post_soviet_child, ref = "1")]
+russ_wvs[, has_higher_edu := relevel(has_higher_edu, ref = "1")]
+
+str(russ_wvs)
+```
+
+checkpoint - 1
+
+save(russ_wvs, file = "russ_wvs.rdata") \#
+load("/Users/viktorledenev/Desktop/EU - courses/Kolich -
+2/Midterm/russ_wvs.rdata")
+
+### Регрессионная модель - отбор предикторов. Контрольные и контрольно-содержательные.
+
+Сделаем в два этапа для удобства сравнения моделей: Начнем с контрольных
+и контрольно-содержательных предикторов.
+
+\$ sex : Factor w/ 2 levels "Male","Fem": 2 2 1 2 2 1 1 2 1 1 ... \$ age
+: int 36 58 42 47 61 69 40 78 51 28 ... \$ marriage_history : Factor w/
+2 levels "0","1": 1 2 2 1 1 1 2 2 2 1 ... \$ child_number_factor :
+Factor w/ 4 levels "0","1","2","3+": 3 3 3 2 3 3 2 1 3 1 ... \$
+job_career_oriented : Factor w/ 2 levels "1","0": 2 1 1 2 1 2 1 2 2 1
+... \$ has_higher_edu : Factor w/ 2 levels "1","0": 2 1 1 1 1 2 2 2 1 2
+...
+
+```{r}
+mod0 <- lm(finance_satisfaction ~ 1, data = russ_wvs, weights = weights)
+mod1 <- lm(finance_satisfaction ~ sex, data = russ_wvs, weights = weights)
+mod2 <- lm(finance_satisfaction ~ sex + age, data = russ_wvs, weights = weights)
+mod3 <- lm(finance_satisfaction ~ sex + age + marriage_history, data = russ_wvs, weights = weights)
+mod4 <- lm(finance_satisfaction ~ sex + age + marriage_history + child_number_factor, data = russ_wvs, weights = weights)
+mod5 <- lm(finance_satisfaction ~ sex + age + marriage_history + child_number_factor + job_career_oriented, data = russ_wvs, weights = weights)
+mod6 <- lm(finance_satisfaction ~ sex + age + marriage_history + child_number_factor + job_career_oriented + has_higher_edu, data = russ_wvs, weights = weights)
+```
+
+```{r}
+tab_model(mod0, mod1, mod2, mod3, mod4, mod5, mod6,
+  show.aic = T, 
+  show.ci = F,
+  dv.labels = c("0","1", "2", "3", "4", "5", "6"))
+```
+
+```{r}
+anova(mod0, mod1)
+anova(mod0, mod2)
+anova(mod2, mod3)
+anova(mod2, mod4)
+anova(mod2, mod5)
+anova(mod5, mod6)
+```
+
+R2 adjusted 0.000 0.001 0.031 0.031 0.033 0.044 0.048 AIC 8094.476
+8094.347 8039.053 8041.050 8039.245 8020.580 8012.743
+
+Модель 1 (пол) (1) мизерно улучшает R\^2, поправленный на число
+предикторов; (2) мизерно улучшает AIC; (3) значимо не отличаются по
+ANOVA'e. Далее пол доходит до очень высоких показателей p-value, что
+говорит об огромных доверительных интервалах =\> с учетом того, что
+проект учебный уберем этот контрольный предиктор, чтобы не усложнять
+подбор модели.
+
+Модель 3 (был ли брак) (1) не улучшает R\^2, поправленный на число
+предикторов; (2) не улучшает AIC; (3) значимо не отличаются по ANOVA'е.
+
+### Регрессионная модель - отбор предикторов. Cодержательные.
+
+```{r}
+mod_0 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu, data = russ_wvs, weights = weights)
+mod_1 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important, data = russ_wvs, weights = weights)
+mod_2 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure, data = russ_wvs, weights = weights)
+mod_3 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + perseverance_important, data = russ_wvs, weights = weights)
+mod_4 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + perseverance_important + trust_to_nonames, data = russ_wvs, weights = weights)
+mod_5 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + perseverance_important + trust_to_nonames + ind_vs_gov_responsible, data = russ_wvs, weights = weights)
+mod_6 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + perseverance_important + trust_to_nonames + ind_vs_gov_responsible + freerid_just, data = russ_wvs, weights = weights)
+mod_7 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + perseverance_important + trust_to_nonames + ind_vs_gov_responsible + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+```
+
+```{r}
+tab_model(mod_0, mod_1, mod_2, mod_3, mod_4, mod_5, mod_6, mod_7,
+  show.aic = T,
+  show.ci = F,
+  dv.labels = c("Quasi 0", "1", "2", "3", "4", "5", "6", "7"))
+```
+
+```{r}
+anova(mod_0, mod_1)
+anova(mod_0, mod_2)
+anova(mod_2, mod_3)
+anova(mod_2, mod_4)
+anova(mod_4, mod_5)
+anova(mod_5, mod_6)
+anova(mod_6, mod_7)
+```
+
+R2 adjusted 0.049 0.050 0.054 0.054 0.062 0.085 0.089 0.096 AIC 8009.666
+8008.656 8001.915 8003.650 7989.549 7945.070 7937.955 7925.375
+
+Модель 3 не улучшает R\^2, делает хуже AIC, не значима по ANOVA'е =\>
+отбросим предикторы из нее (perseverance_important). Однако
+hardwork_important наиболее интересны содержательно, поэтому попробуем
+спасти интерактивными эффектами. Кроме того, второе прокси трудовых
+карьерных инвестиций (hardwork_over_leisure) заметно не пересекается с
+hardwork_important (см. ниже).
+
+```{r}
+chisq.test(russ_wvs$hardwork_important, as.factor(russ_wvs$hardwork_over_leisure)) #p below threshold
+
+var.test(hardwork_over_leisure ~ hardwork_important, data = russ_wvs)
+# p-value above threshold - do not reject that variances of groups are equal =>  no Welch correction
+t.test(hardwork_over_leisure ~ hardwork_important, data = russ_wvs, var.equal = F) # significant difference
+```
+
+modi_7 \<- lm(finance_satisfaction \~ age + child_number_factor +
+job_career_oriented + has_higher_edu + hardwork_important +
+hardwork_over_leisure + trust_to_nonames + ind_vs_gov_responsible +
+freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+
+### Регрессионная модель - отбор предикторов. Интеракция: постсоветское поколение.
+
+```{r}
+modi_0 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + ind_vs_gov_responsible + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+modi_1 <- lm(finance_satisfaction ~ age * post_soviet_child + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + ind_vs_gov_responsible + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+modi_2 <- lm(finance_satisfaction ~ age + child_number_factor * post_soviet_child + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + ind_vs_gov_responsible + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+modi_3 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented * post_soviet_child + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + ind_vs_gov_responsible + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+modi_4 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu * post_soviet_child + hardwork_important + hardwork_over_leisure + trust_to_nonames + ind_vs_gov_responsible + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+modi_5 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important * post_soviet_child + hardwork_over_leisure + trust_to_nonames + ind_vs_gov_responsible + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+modi_6 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure * post_soviet_child + trust_to_nonames + ind_vs_gov_responsible + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+modi_7 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames * post_soviet_child + ind_vs_gov_responsible + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+modi_8 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + ind_vs_gov_responsible * post_soviet_child + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+modi_9 <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + ind_vs_gov_responsible + freerid_just * post_soviet_child + post_soviet_child, data = russ_wvs, weights = weights)
+```
+
+```{r}
+tab_model(modi_0, modi_1, modi_2,modi_3,modi_4,modi_5,modi_6,modi_7,modi_8,modi_9, 
+  show.aic = T, 
+  show.ci = F,
+  dv.labels = c("Quasi 0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+BIC(modi_0, modi_1, modi_2,modi_3,modi_4,modi_5,modi_6,modi_7,modi_8,modi_9)[, "BIC"]
+```
+
+```{r}
+anova(modi_0, modi_1)
+anova(modi_0, modi_2)
+anova(modi_0, modi_3)
+anova(modi_0, modi_4)
+anova(modi_0, modi_5)
+anova(modi_0, modi_6)
+anova(modi_0, modi_7)
+anova(modi_0, modi_8)
+anova(modi_0, modi_9)
+```
+
+По ANOVA't, Adj R\^2, AIC'у, BIC'у и наличию значимой интеракции
+проходят только интеракция с возрастом и распределением ответственности
+между правительством. Интеракцию принадлежности к постсоветскому
+поколению, однако, мы в любом случае не сможем разделить эффект
+принадлежности к постсоветскому поколению на финансовую
+удовлетворенность и влияние возраста на доход, который влияет на
+финансовую удовлетворенность.
+
+Соответственно, итоговая модель: modi_8. lm(finance_satisfaction \~
+age + child_number_factor + job_career_oriented + has_higher_edu +
+hardwork_important + hardwork_over_leisure + trust_to_nonames +
+ind_vs_gov_responsible \* post_soviet_child + freerid_just +
+post_soviet_child, data = russ_wvs, weights = weights)
+
+### Регрессионная модель: диагностика.
+
+```{r}
+sel_model <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + ind_vs_gov_responsible * post_soviet_child + freerid_just + post_soviet_child, data = russ_wvs, weights = weights)
+```
+
+## Мультиколлинеарность
+
+```{r}
+vif(sel_model)
+```
+
+Возраст, постсоветский ребенок, индивидуальная/государственная
+ответственность, интеракция последних проблематичны.
+
+Проверим, что лучше удалить из модели: возраст или постсоветскость.
+
+```{r}
+test_modeli_no_age <- lm(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, data = russ_wvs, weights = weights)
+
+test_model_no_age <- lm(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible + post_soviet_child, data = russ_wvs, weights = weights)
+
+test_modeli_no_post_soviet <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * age, data = russ_wvs, weights = weights)
+
+test_model_no_post_soviet <- lm(finance_satisfaction ~ age + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible, data = russ_wvs, weights = weights)
+
+tab_model(test_model_no_age, test_modeli_no_age, test_model_no_post_soviet, test_modeli_no_post_soviet,
+  show.aic = T, 
+  show.ci = F,
+  dv.labels = c("No age No int","No age Yes int", "No post-soviet No int", "No post-soviet Yes in"))
+
+BIC(test_model_no_age, test_modeli_no_age, test_model_no_post_soviet, test_modeli_no_post_soviet)[,2]
+```
+
+R2 adjusted 0.096 0.103 0.089 0.093 AIC 7921.916 7910.182 7936.187
+7929.281 BIC 7993.430 7987.197 8007.701 8006.296
+
+По всем трем параметрам модель с пост-советским критерием лучше =\>
+берем ее.
+
+```{r}
+sel_model <- test_modeli_no_age
+```
+
+```{r}
+vif(sel_model)
+vif(test_model_no_age)
+
+# Warning: there are higher-order terms (interactions) in this model consider setting type = 'predictor'; see ?vif
+# type = 'predictor' doesn't work for weighted linear models => just be cautios.
+```
+
+Теперь ок. Мультиколлинеарность возникает из-за интеракции. Без нее все
+ок.
+
+## Гетероскедастичность
+
+```{r}
+ncvTest(sel_model)
+# null hypothesis of homoscedasticity
+
+plot(sel_model)
+```
+
+В NCV - тесте p ниже порогового значения =\> отвергаем гипотезу о
+гомоскедастичности. На 1 (residuals vs fitted) и 3 (sqrt(residuals) vs
+fitted) графиках красная линия должна быть горизонтальной, что не так
+=\> можем говорить о нарушении требования о гомоскедастичности.
+
+## Поиск переменной, создающей гетероскедастичность
+
+```{r}
+residuals_sel_model <- resid(sel_model) # save the residuals from
+
+plot(russ_wvs$child_number_factor, residuals_sel_model,
+ylab="Residuals", xlab="child_number_factor")
+abline(0,0, col="red")
+
+plot(russ_wvs$job_career_oriented, residuals_sel_model,
+ylab="Residuals", xlab="job_career_oriented")
+abline(0,0, col="red")
+
+plot(russ_wvs$has_higher_edu, residuals_sel_model,
+ylab="Residuals", xlab="has_higher_edu")
+abline(0,0, col="red")
+
+plot(russ_wvs$hardwork_important, residuals_sel_model,
+ylab="Residuals", xlab="hardwork_important")
+abline(0,0, col="red")
+
+plot(russ_wvs$hardwork_over_leisure, residuals_sel_model,
+ylab="Residuals", xlab="hardwork_over_leisure")
+abline(0,0, col="red")
+
+plot(russ_wvs$trust_to_nonames, residuals_sel_model,
+ylab="Residuals", xlab="trust_to_nonames")
+abline(0,0, col="red")
+
+plot(russ_wvs$freerid_just, residuals_sel_model,
+ylab="Residuals", xlab="freerid_just")
+abline(0,0, col="red")
+
+plot(russ_wvs$ind_vs_gov_responsible, residuals_sel_model,
+ylab="Residuals", xlab="ind_vs_gov_responsible")
+abline(0,0, col="red")
+
+plot(russ_wvs$post_soviet_child, residuals_sel_model,
+ylab="Residuals", xlab="post_soviet_child")
+abline(0,0, col="red")
+```
+
+По графикам мы видим, что остатки распределяются по-различному по сути
+на всех переменных =\> сначала решим вопрос с трансформацией.
+
+```{r}
+summary(powerTransform(sel_model))
+```
+
+Предлагаемая трансформация не очень сильно поможет (ее доверительный
+интервал пересекает 0). Вероятно, причина в нелинейном характере связи
+или автокорелляции.
+
+Мы не видим причин подозревать автокорелляцию по времени, поскольку
+данные каждой волны WVS - snapshot на конкретный момент времени (Хотя
+Durbin-Watson тест значимый). Мы предполагали, что есть риск
+пространственной автокорелляции, однако это маловероятно, поскольку
+наблюдения-респонденты едва ли связаны друг с другом, а "...spatial
+autocorrelation. This problem occurs when the units in the data are
+spatial areas, such as neighborhoods, counties, states, or nations."
+(Hoffmann J. P. Linear regression models: applications in R. -- Crc
+Press, 2021. P. 158).
+
+## Нормальность остатков
+
+```{r}
+qqnorm(sel_model$residuals)
+
+mean(sel_model$residuals) 
+```
+
+Остатки распределены не совсем нормально, хотя среднее близко к 0.
+
+## Outliers
+
+Cook's distance
+
+"Cook's distance is a measure of the overall influence of a case on the
+model, and Cook and Weisberg (1982) have suggested that values greater
+than 1 may be cause for concern" (Field A., Miles J., Field Z.
+Discovering statistics using R. -- Sage publications, 2012.) Larger
+values of Cook's D indicate more influence on the regression results.
+Two recommended criteria for Cook's D are (a) D ≥ 1.0 and (b) D ≥ 4/(n −
+k − 1) (Hoffmann J. P. Linear regression models: applications in R. --
+Crc Press, 2021.)
+
+```{r}
+length(cooks.distance(sel_model)[cooks.distance(sel_model) > 1])
+length(cooks.distance(sel_model)[cooks.distance(sel_model) > 4/(nrow(russ_wvs) - 10 - 1)])
+```
+
+Leverages
+
+"Hoaglin and Welsch (1978) recommend investigating cases with values
+greater than twice the average (2(k + 1)/n) and Stevens (2002)
+recommends using three times the average (3(k + 1)/n) as a cut-off point
+for identifying cases having undue influence." (Hoffmann J. P. Linear
+regression models: applications in R. -- Crc Press, 2021.)
+
+```{r}
+length(hatvalues(sel_model)[hatvalues(sel_model) > ((10+1)/nrow(russ_wvs))*3])
+length(hatvalues(sel_model)[hatvalues(sel_model) > ((10+1)/nrow(russ_wvs))*2])
+```
+
+Формальный тест
+
+```{r}
+outlierTest(sel_model)
+# The test is non-significant, and the outliers are not a serious problem for the model.
+```
+
+У нас есть заметное число аутлайеров в т.ч. по cook's distance. Проверим
+их, однако, после трансформации с учетом незначительного значения теста
+Бонферрони.
+
+## Нелинейность связи
+
+```{r}
+plot(sel_model)
+```
+
+На первом графике мы видим по нелинейности красной линии, которая не
+идет по нулю на оси Y, что линейность нарушена.
+
+```{r}
+# Doesn't work with freerid_just in a model and with more than one predictor to be transformed
+boxTidwell(finance_satisfaction ~ hardwork_over_leisure, other.x= ~  ind_vs_gov_responsible+child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, max.iter = 100, tol = 0.01, data = russ_wvs)
+
+ggplot(russ_wvs, aes(x = hardwork_over_leisure, y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+```
+
+График показывает нелинейность l = - 1.1196 p = 0.01781 =\> transform
+
+```{r}
+boxTidwell(finance_satisfaction ~ ind_vs_gov_responsible, other.x= ~ freerid_just + hardwork_over_leisure + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, max.iter = 100, tol = 0.01, data = russ_wvs)
+
+ggplot(russ_wvs, aes(x = ind_vs_gov_responsible, y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+```
+
+График показывает небольшую нелинейность. p = 0.1757 =\> do not
+transform
+
+```{r}
+boxTidwell(finance_satisfaction ~ freerid_just, other.x= ~ ind_vs_gov_responsible + hardwork_over_leisure + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, max.iter = 100, tol = 0.01, data = russ_wvs)
+
+ggplot(russ_wvs, aes(x = freerid_just, y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+```
+
+График показывает небольшую нелинейность. p = 0.9291 =\> do not
+transform
+
+Тест Бокса-Тидвелла предлагает возвести hardwork_over_leisure в
+степень - 1.1196 (MLE of lambda). Размер предлагаемой тестом
+трансформации падает с добавлением предикторов + тест не позволил
+включить все переменные, поэтому можно попробовать трансформировать в -1
+степень.
+
+### Трансформация из теста Бокса-Тидвелла
+
+```{r}
+# No hardwork_over_leisure - our quasi null model for comparison of nested models
+modt_0 <- lm(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, data = russ_wvs, weights = weights)
+# hardwork_over_leisure is not transformed
+sel_model_pre_trans <- test_modeli_no_age <- lm(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, data = russ_wvs, weights = weights)
+#hardwork_over_leisure is transformed
+sel_model <- lm(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, data = russ_wvs, weights = weights)
+```
+
+```{r}
+tab_model(modt_0, sel_model_pre_trans, sel_model,
+  show.aic = T, 
+  show.ci = F,
+  dv.labels = c("No hardw over leis", "No transformation" ,"Transformation"))
+
+BIC(modt_0, sel_model_pre_trans, sel_model)[,"BIC"]
+
+anova(modt_0, sel_model_pre_trans)
+anova(modt_0, sel_model)
+```
+
+Все модели лучше "нулевой" модели по adjusted R\^2'y и AIу'e, но хуже по
+BIC'у. 2 против 1 за включение hardwork_over_leisure. По всем трем
+показателям модель с трансформацией лучше =\> оставляем ее.
+
+### Регрессионная модель: диагностика, круг ~~ада~~ № 2.
+
+## Мультиколлинеарность - 2
+
+```{r}
+vif(sel_model)
+```
+
+Все ок.
+
+## Нелинейность связи - 2
+
+```{r}
+plot(sel_model)
+plot(sel_model_pre_trans)
+```
+
+Сравнение первых графиков показывает, что мы несколько изменили
+нелинейность в центре (пересечение красной линии с нулевой происходит
+позже, поэтому превышение красной над нулевой меньше, однако больше
+сниженность красной до пересечения нулевой) =\> неясно, стало ли лучше.
+
+```{r}
+# Doesn't work with freerid_just in a model and with more than one predictor to be transformed
+boxTidwell(finance_satisfaction ~ I(hardwork_over_leisure^-1), other.x= ~  ind_vs_gov_responsible+child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, max.iter = 100, tol = 0.01, data = russ_wvs)
+
+ggplot(russ_wvs, aes(x = I(hardwork_over_leisure^-1), y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+
+ggplot(russ_wvs, aes(x = hardwork_over_leisure, y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+```
+
+График показывает нелинейность, которая теперь смещена на меньшие
+значения hardwork_over_leisure, но визуально кажется менее заметной в
+целом.
+
+p = 0.8896 =\> do not transform
+
+```{r}
+boxTidwell(finance_satisfaction ~ ind_vs_gov_responsible, other.x= ~ freerid_just + I(hardwork_over_leisure^-1) + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, max.iter = 100, tol = 0.01, data = russ_wvs)
+
+```
+
+График показывает небольшую нелинейность. p = 0.2102 =\> do not
+transform
+
+```{r}
+boxTidwell(finance_satisfaction ~ freerid_just, other.x= ~ ind_vs_gov_responsible + I(hardwork_over_leisure^-1) + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, max.iter = 100, tol = 0.01, data = russ_wvs)
+```
+
+p = 0.8092 =\> do not transform
+
+Пока что далее трансформации не требуются.
+
+## Гетероскедастичность - 2
+
+```{r}
+ncvTest(sel_model)
+ncvTest(sel_model_pre_trans)
+# null hypothesis of homoscedasticity
+```
+
+В NCV - тесте p ниже порогового значения =\> отвергаем гипотезу о
+гомоскедастичности. По графику 1 из plot(model) не ясна разница с
+предыдущей можелью (см. выше), график 3 не показывает разницы.
+
+## Проверка гетероскедастичности hardwork_over_leisure
+
+```{r}
+residuals_sel_model <- resid(sel_model) 
+residuals_sel_model_pre_trans <- resid(sel_model_pre_trans)
+
+plot(1/russ_wvs$hardwork_over_leisure, residuals_sel_model,
+ylab="Residuals", xlab="hardwork_over_leisure")
+abline(0,0, col="red")
+
+plot(russ_wvs$hardwork_over_leisure, residuals_sel_model_pre_trans,
+ylab="Residuals", xlab="hardwork_over_leisure")
+abline(0,0, col="red")
+
+```
+
+Из графика кажется, что стало лучше, но однозначной уверенности нет.
+
+```{r}
+summary(powerTransform(sel_model))
+```
+
+Предлагаемая трансформация не очень сильно поможет (ее доверительный
+интервал пересекает 0). Нелинейность, где оправданно, мы исправили,
+поэтому потребуются робастные ошибки, если дальнейшая диагностика не
+поможет найти выход.
+
+## Нормальность остатков - 2
+
+```{r}
+qqnorm(sel_model$residuals)
+qqnorm(sel_model_pre_trans$residuals)
+
+mean(sel_model$residuals) 
+mean(sel_model_pre_trans$residuals) 
+```
+
+Мы видим выравнивание остатков относительно гипотетической диагонали в
+начале и наоборот в конце. Среднее, однако, ухудшилось, отдавлившись от
+нуля.
+
+## Outliers - 2
+
+Cook's distance
+
+```{r}
+length(cooks.distance(sel_model)[cooks.distance(sel_model) > 1])
+length(cooks.distance(sel_model)[cooks.distance(sel_model) > 4/(nrow(russ_wvs) - 10 - 1)])
+
+length(cooks.distance(sel_model_pre_trans)[cooks.distance(sel_model_pre_trans) > 1])
+length(cooks.distance(sel_model_pre_trans)[cooks.distance(sel_model_pre_trans) > 4/(nrow(russ_wvs) - 10 - 1)])
+```
+
+Leverages
+
+```{r}
+length(hatvalues(sel_model)[hatvalues(sel_model) > ((10+1)/nrow(russ_wvs))*3])
+length(hatvalues(sel_model)[hatvalues(sel_model) > ((10+1)/nrow(russ_wvs))*2])
+
+length(hatvalues(sel_model_pre_trans)[hatvalues(sel_model_pre_trans) > ((10+1)/nrow(russ_wvs))*3])
+length(hatvalues(sel_model_pre_trans)[hatvalues(sel_model_pre_trans) > ((10+1)/nrow(russ_wvs))*2])
+```
+
+Формальный тест
+
+```{r}
+outlierTest(sel_model)
+# The test is non-significant, and the outliers are not a serious problem for the model.
+```
+
+У нас есть заметное число аутлайеров (по жестким критериям число
+влияющих на модель сократилось, а влияющих на ауткам выросло; по мягким
+критериям ничего не изменилось) По формальному тесту они по-прежнему не
+являются влиятельными.
+
+### Анализ аутлаеров
+
+```{r}
+russ_wvs[, levervalues := hatvalues(sel_model)]
+russ_wvs[, cooksvalues := cooks.distance(sel_model)]
+russ_wvs[, is_lever_out := as.factor(fifelse(levervalues > (10+1)/nrow(russ_wvs)*2, 1, 0))]
+russ_wvs[, is_cookd_out := as.factor(fifelse(cooksvalues > 4/(nrow(russ_wvs) - 10 - 1), 1, 0))]
+
+russ_wvs[, is_lever_out := relevel(is_lever_out, ref = "1")]
+russ_wvs[, is_cookd_out := relevel(is_cookd_out, ref = "1")]
+```
+
+```{r}
+table(russ_wvs$is_lever_out, russ_wvs$is_cookd_out)
+```
+
+## Проверка распределений
+
+```{r}
+ggplot(russ_wvs, aes(x = age)) + 
+  geom_histogram(binwidth = 0.5)+
+  facet_wrap(~ is_lever_out)
+
+ggplot(russ_wvs, aes(x = age)) + 
+  geom_histogram(binwidth = 0.5)+
+  facet_wrap(~ is_cookd_out)
+
+ggplot(russ_wvs, aes(x = is_lever_out , fill = post_soviet_child)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = is_cookd_out , fill = post_soviet_child)) + 
+  geom_bar(position = "fill")
+```
+
+Both types of outliers tend to be more young / born close to or after
+USSR's disruption. Especially leverage outliers.
+
+```{r}
+ggplot(russ_wvs, aes(x = is_lever_out, fill = as.factor(finance_satisfaction))) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = is_cookd_out, fill = as.factor(finance_satisfaction))) + 
+  geom_bar(position = "fill")
+```
+
+Cook's distance outliers have extreme values of outcome (transformation
+of Y is actually needed?) Tendency is less vivid for leverage outliers
+(which is associated with cook's distance influence on model).
+
+```{r}
+ggplot(russ_wvs, aes(x = is_lever_out, fill = hardwork_important)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = is_cookd_out, fill = hardwork_important)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = post_soviet_child, fill = hardwork_important)) + 
+  geom_bar(position = "fill")
+```
+
+Leverage outliers tend to have hardwork_important == 0 more often than
+other observations. The same applies to post-soviet children.
+
+```{r}
+ggplot(russ_wvs, aes(x = is_lever_out, fill = as.factor(hardwork_over_leisure))) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = is_cookd_out, fill = as.factor(hardwork_over_leisure))) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = post_soviet_child, fill = as.factor(hardwork_over_leisure))) + 
+  geom_bar(position = "fill")
+```
+
+Leverage outliers tend to have hardwork_over_leisure == 1 more often
+than other observations. The same applies to cook's distance outliers
+which also tend to have hardwork_over_leisure == 5 more often. Much less
+vivid effect for post-soviet children.
+
+```{r}
+ggplot(russ_wvs, aes(x = is_lever_out, fill = trust_to_nonames)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = is_cookd_out, fill = trust_to_nonames)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = post_soviet_child, fill = trust_to_nonames)) + 
+  geom_bar(position = "fill")
+```
+
+both types of outliers are a bit more trusty For post-soviet children
+effect is reverse.
+
+```{r}
+ggplot(russ_wvs, aes(x = is_lever_out, fill = has_higher_edu)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = is_cookd_out, fill = has_higher_edu)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = post_soviet_child, fill = has_higher_edu)) + 
+  geom_bar(position = "fill")
+```
+
+Leverage outliers tend to have has_higher_edu == 1 more often than other
+observations No effect fot other outliers and post-soviet children.
+
+```{r}
+ggplot(russ_wvs, aes(x = is_lever_out, fill = child_number_factor)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = is_cookd_out, fill = child_number_factor)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = post_soviet_child, fill = child_number_factor)) + 
+  geom_bar(position = "fill")
+```
+
+Both types of outliers tend to have no children or plethora of children
+more often than other observations. The effect is much more vivid for
+post-soviet children.
+
+```{r}
+ggplot(russ_wvs, aes(x = is_lever_out , fill = job_career_oriented)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = is_cookd_out , fill = job_career_oriented)) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = post_soviet_child, fill = job_career_oriented)) + 
+  geom_bar(position = "fill")
+```
+
++- the same, but both types of outliers tend to have career oriented job
+status a bit more often. But post-soviet children have the same, but
+much more vivid effect.
+
+```{r}
+ggplot(russ_wvs, aes(x = is_lever_out , fill = as.factor(ind_vs_gov_responsible))) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = is_cookd_out , fill = as.factor(ind_vs_gov_responsible))) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = post_soviet_child, fill = as.factor(ind_vs_gov_responsible))) + 
+  geom_bar(position = "fill")
+```
+
+Both types look more radical with repspect to dilemma on gover vs
+individual responsibility. But the effect is more vivid for leverage
+outliers with regard to more often support of individual primacy and
+otherwise. No effect for post-soviet children.
+
+```{r}
+ggplot(russ_wvs, aes(x = is_lever_out , fill = as.factor(freerid_just))) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = is_cookd_out , fill = as.factor(freerid_just))) + 
+  geom_bar(position = "fill")
+
+ggplot(russ_wvs, aes(x = post_soviet_child, fill = as.factor(freerid_just))) + 
+  geom_bar(position = "fill")
+```
+
+Leverage outliers tend to radically ignore freeriding more often. Cook's
+distance outliers tend to radically disapprove freeriding more often.
+Post-soviet children are more like leverage outliers.
+
+0.  Both types of outliers tend to be more young / born close to or
+    after USSR's disruption. Especially leverage outliers.
+
+1.  Leverage outliers tend to have believe that hardwork is not
+    important more often than other observations. The same applies to
+    post-soviet children.
+
+-   
+
+2.  Leverage outliers tend to have radically disagree with prevalation
+    of hardwork over leisure more often than other observations. The
+    same applies to cook's distance outliers which also tend to have
+    radically agree observations more often. Much less vivid effect for
+    post-soviet children. +-
+
+3.  Both types of outliers are a bit more trusty For post-soviet
+    children effect is reverse.
+
+-   
+
+4.  Leverage outliers tend to have higher education more often than
+    other observations No effect for other outliers and post-soviet
+    children.
+
+-   
+
+5.  Both types of outliers tend to have no children or plethora of
+    children more often than other observations. The effect is much more
+    vivid for post-soviet children. +-
+
+6.  +- the same, but both types of outliers tend to have career oriented
+    job status a bit more often. But post-soviet children have the same,
+    but much more vivid effect. +-
+
+7.  Both types look more radical with repspect to dilemma on gover vs
+    individual responsibility. But the effect is more vivid for leverage
+    outliers with regard to more often support of individual primacy and
+    otherwise. No effect for post-soviet children. +-
+
+8.  Leverage outliers tend to radically ignore freeriding more often.
+    Cook's distance outliers tend to radically disapprove freeriding
+    more often. Post-soviet children are more like leverage outliers. +-
+
+Cook's distance аутлаеры, имеющие большое влияние на модель, склонны
+приобретать крайние значения ауткама (1-10). То есть экстремально
+довольные/недовольные влияют на результат очень сильно. Надо попробовать
+найти подходящую трансформацию, чтобы сгладить хвосты. Попробуем
+предложенную powertransform. Вывести, что за особые наблюдения с высоким
+cook's distance, однако не получается.
+
+Мы видим, что наблюдения с большим рычагом отражают некоторую достаточно
+специфичную группу индивидов, которые более молоды, склонны не возлагать
+ответственность на гос-во, не имеют детей, карьерно-ориентированны,
+больше доверяют незнакомым людям и при этом более благосклонны к
+проездам зайцем. Эта группа людей выглядит как смесь стереотипных
+представлений о безответственном пост-советском поколении либо как из
+обеих частей "Духлесса", нюхающем кокаин и зарабатывающем миллионы, либо
+как из рассказов "бабок у подъезда" о студентах, которые "обколются
+своей марихуаною".
+
+```{r}
+russ_wvs[, is_lever_out := relevel(is_lever_out, ref = "0")]
+ggplot(russ_wvs, aes(x = finance_satisfaction, y = age, color = is_lever_out, size = is_lever_out)) + 
+  geom_point()
+russ_wvs[, is_lever_out := relevel(is_lever_out, ref = "1")]
+
+n_of_leverages <- table(russ_wvs$is_lever_out)[2]
+```
+
+Мы видим, что наблюдения с большим рычагом отражают некоторую достаточно
+специфичную группу индивидов, которые более молоды, склонны не возлагать
+ответственность на гос-во, не имеют детей, карьерно-ориентированны,
+больше доверяют незнакомым людям и при этом более благосклонны к
+проездам зайцем. Эта группа людей выглядит как смесь стереотипных
+представлений о безответственном пост-советском поколении либо как из
+обеих частей "Духлесса", нюхающем кокаин и зарабатывающем миллионы, либо
+как из рассказов "бабок у подъезда" о студентах, которые "обколются
+своей марихуаною". Наблюдений слишком мало ('r n_of_leverages'), чтобы
+делать на нем отдельную регрессиию с 10 предикторами и робастными
+ошибками. Поэтому попробуем построить модель, удалив наиболее сильные
+рычаги, которые фильтруются по слабому критерию для рычагов.
+
+### Удаление радикальных рычагов и нетрансформация ауткама
+
+Трансформация по тесту Бокса-Кокса
+
+```{r}
+summary(powerTransform(sel_model))[["result"]][1]
+# 0.9941549
+russ_wvs[, finance_satisfaction_boxcox := finance_satisfaction^summary(powerTransform(sel_model))[["result"]][1]]
+```
+
+Э. Филд рекомендует трансформировать ауткам через sqrt (Field A. et. al.
+Op. cit. p. 192). Мы попробовали это сделать, но гетероскедастичность
+модели выросла (стало сильно больше положительных остатков на протяжении
+всех значений) + ненормальность остатков стала хуже.
+
+Мы также проверили fit модели с трансформацией Бокса-Кокса. Она
+становится чуть лучше по AIC'у, но в плане диагностики модель не
+становится лучше. При этом введение степени на ауткам заметно усложнит
+интерпретацию. Поэтому мы откажемся от нее.
+
+```{r}
+# Observations to be deleted
+nrow(russ_wvs[]) - nrow(russ_wvs[levervalues < ((10+1)/nrow(russ_wvs))*3, ])
+russ_wvs_with_leverages <- russ_wvs
+russ_wvs <- russ_wvs[levervalues < ((10+1)/nrow(russ_wvs))*3, ]
+```
+
+```{r}
+# full data
+sel_model_pre_trans <- lm(finance_satisfaction_boxcox ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, data = russ_wvs_with_leverages, weights = weights)
+
+sel_model_pre_trans_with_leverages <- lm(finance_satisfaction_boxcox ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, data = russ_wvs_with_leverages, weights = weights)
+
+# data with no leverages
+sel_model_pre_trans_no_leverages <- lm(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, data = russ_wvs, weights = weights)
+```
+
+```{r}
+tab_model(sel_model_pre_trans, sel_model_pre_trans_with_leverages, sel_model_pre_trans_no_leverages,
+  show.aic = T, 
+  show.ci = F,
+  dv.labels = c("Old model and data","New model and old data", "New model and new data"))
+
+BIC(sel_model_pre_trans, sel_model_pre_trans_with_leverages, sel_model_pre_trans_no_leverages)[,2]
+```
+
+Модель без крайних рычагов показывают удивительно меньший фит по R\^2
+=\> попробуем модель с и без крайних рычагов, хотя выигрывает по
+AIC/BIC. В результате определимся с лучшими способами "борьбы" с
+аутлайерами.
+
+```{r}
+sel_model_with_lev <- sel_model_pre_trans_with_leverages
+sel_model_no_lev <- sel_model_pre_trans_no_leverages
+```
+
+### Регрессионная модель: диагностика, круг ~~ада~~ № 3.
+
+## Мультиколлинеарность - 3
+
+```{r}
+vif(sel_model_with_lev)
+vif(sel_model_no_lev)
+```
+
+Все ок.
+
+## Нормальность остатков - 3
+
+```{r}
+qqnorm(sel_model_with_lev$residuals)
+qqline(sel_model_with_lev$residuals)
+qqnorm(sel_model_no_lev$residuals)
+qqline(sel_model_no_lev$residuals)
+
+mean(sel_model_with_lev$residuals)
+mean(sel_model_no_lev$residuals)
+```
+
+Разница на графике не кажется заметной, однако средний размер остатков
+ближе к нулю у модели без крупнейших рычагов.
+
+## Outliers - 3
+
+Cook's distance
+
+```{r}
+# "Cook’s distance is a measure of the overall influence of a case on the model, and Cook and Weisberg (1982) have suggested that values greater than 1 may be cause for concern" (Field A., Miles J., Field Z. Discovering statistics using R. – Sage publications, 2012.)
+
+# Larger values of Cook’s D indicate more influence on the regression results. Two recommended criteria for Cook’s D are (a) D ≥ 1.0 and (b) D ≥ 4/(n − k − 1) (Hoffmann J. P. Linear regression models: applications in R. – Crc Press, 2021.)
+
+length(cooks.distance(sel_model_with_lev)[cooks.distance(sel_model_with_lev) > 1])
+length(cooks.distance(sel_model_with_lev)[cooks.distance(sel_model_with_lev) > 4/(nrow(russ_wvs_with_leverages) - 10 - 1)])
+
+length(cooks.distance(sel_model_no_lev)[cooks.distance(sel_model_no_lev) > 1])
+length(cooks.distance(sel_model_no_lev)[cooks.distance(sel_model_no_lev) > 4/(nrow(russ_wvs) - 10 - 1)])
+```
+
+Leverages
+
+```{r}
+"Hoaglin and Welsch (1978) recommend investigating cases with values greater than twice the average (2(k + 1)/n) and Stevens (2002) recommends using three times the average (3(k + 1)/n) as a cut-off point for identifying cases having undue influence."
+
+length(hatvalues(sel_model_with_lev)[hatvalues(sel_model_with_lev) > ((10+1)/nrow(russ_wvs_with_leverages))*3])
+length(hatvalues(sel_model_with_lev)[hatvalues(sel_model_with_lev) > ((10+1)/nrow(russ_wvs_with_leverages))*2])
+
+length(hatvalues(sel_model_no_lev)[hatvalues(sel_model_no_lev) > ((10+1)/nrow(russ_wvs))*3])
+length(hatvalues(sel_model_no_lev)[hatvalues(sel_model_no_lev) > ((10+1)/nrow(russ_wvs))*2])
+```
+
+Формальный тест
+
+```{r}
+outlierTest(sel_model_with_lev)
+outlierTest(sel_model_no_lev)
+# The test is non-significant, and the outliers are not a serious problem for the model.
+```
+
+В модели без крупнейших рычагов мы видим меньше крупнейших рычагов и
+cook's distance аутлаеров, но чуть больше рычагов по более мягкому
+критерию.
+
+## Нелинейность связи - 3
+
+```{r}
+# plot(sel_model_with_lev)
+# plot(sel_model_no_lev)
+```
+
+3 график показывает минимальное выравнивание в модели без аутлаеров (не
+приводятся).
+
+```{r}
+# sel_model_with_lev
+boxTidwell(finance_satisfaction ~ I(hardwork_over_leisure^-1), other.x = ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, 
+    data = russ_wvs_with_leverages, max.iter = 100, tol = 0.01)
+# sel_model_no_lev
+boxTidwell(finance_satisfaction ~ I(hardwork_over_leisure^-1), other.x = ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, 
+    data = russ_wvs, max.iter = 100, tol = 0.01)
+
+
+ggplot(russ_wvs_with_leverages, aes(x = I(hardwork_over_leisure^-1), y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+
+ggplot(russ_wvs, aes(x = I(hardwork_over_leisure^-1), y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+```
+
+График показывает нелинейность, которая по-прежнему смещена на меньшие
+значения hardwork_over_leisure. Она чуть больше сглаживается без
+рычагов.
+
+```{r}
+# sel_model_with_lev
+boxTidwell(finance_satisfaction ~ ind_vs_gov_responsible, other.x = ~ I(hardwork_over_leisure^-1) + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + freerid_just+ post_soviet_child, data = russ_wvs_with_leverages, max.iter = 100, tol = 0.01)
+# sel_model_no_lev
+boxTidwell(finance_satisfaction ~ ind_vs_gov_responsible, other.x = ~ I(hardwork_over_leisure^-1) + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + freerid_just + post_soviet_child, data = russ_wvs, max.iter = 100, tol = 0.01)
+
+
+ggplot(russ_wvs_with_leverages, aes(x = ind_vs_gov_responsible, y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+
+ggplot(russ_wvs, aes(x = ind_vs_gov_responsible, y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+```
+
+График показывает небольшую нелинейность. Модель с рычагами выглядит
+чуть-чуть линейнее.
+
+```{r}
+# sel_model_with_lev
+boxTidwell(finance_satisfaction ~ freerid_just, other.x = ~ I(hardwork_over_leisure^-1) + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + ind_vs_gov_responsible * post_soviet_child, data = russ_wvs_with_leverages, max.iter = 100, tol = 0.01)
+# sel_model_no_lev
+boxTidwell(finance_satisfaction ~ freerid_just, other.x = ~ I(hardwork_over_leisure^-1) + child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + trust_to_nonames + ind_vs_gov_responsible * post_soviet_child, data = russ_wvs, max.iter = 100, tol = 0.01)
+
+
+ggplot(russ_wvs_with_leverages, aes(x = freerid_just, y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+
+ggplot(russ_wvs, aes(x = freerid_just, y = finance_satisfaction))+
+  geom_point()+
+  geom_smooth(method = "loess")
+```
+
++- одинаковые
+
+## Гетероскедастичность - 3
+
+```{r}
+ncvTest(sel_model_with_lev)
+ncvTest(sel_model_no_lev)
+```
+
+В NCV - тесте p ниже порогового значения =\> отвергаем гипотезу о
+гомоскедастичности для обеих моделей.
+
+```{r}
+summary(powerTransform(sel_model_with_lev))
+summary(powerTransform(sel_model_no_lev))
+```
+
+Предлагаемая трансформация модели без рычагов не очень сильно поможет
+(ее доверительный интервал пересекает 0). Нелинейность, где оправданно,
+мы исправили, поэтому потребуются робастные ошибки.
+
+Мы предпочтем оставить данные с рычагами. Мы не особо улучшаем
+диагностические параметры, но проигрываем по adj R\^2, теряя особенные
+по своим характеристикам наблюдения.
+
+По большинству диагностических параметров модель на данных без крайних
+рычагов подходит лучше, хоть она и хуже по adjR\^2 (sel_model_no_lev).
+Реализуем модель с робастными ошибками (с учетом гетероскедастичности).
+
+```{r}
+sel_model <- sel_model_with_lev
+```
+
+```{r}
+russ_wvs <- russ_wvs_with_leverages
+```
+
+### Модель с робастными se
+
+```{r}
+sel_model_se_huber <- rlm(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, data = russ_wvs, weights = weights, psi = psi.huber)
+sel_model_se_bisquare <- rlm(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, data = russ_wvs, weights = weights, psi = psi.bisquare)
+```
+
+## Сравнение моделей с робастными se
+
+```{r}
+tab_model(sel_model, sel_model_se_huber, sel_model_se_bisquare,
+  show.aic = T, 
+  show.ci = F,
+  dv.labels = c("No se","Huber SE", "Bisquare SE"))
+
+BIC(sel_model, sel_model_se_huber, sel_model_se_bisquare)[2]
+```
+
+Показатели BIC/AIC свидетельствуют в пользу se Губера. Кроме того, по
+формальному тесту (outlierTest) у нас не было влиятельных outlier'ов, а
+se Губера проблематичны в обратных случаях.
+
+В созданной модели мы видим проблему со многими допущениями, не все из
+которых мы можем исправить как гетероскедастичность: (1) потенциально
+проблемные аутлауеры (что намекает на проблемы с соответствием
+предсказанных значений); (2) нелинейные связи, которые мы не смогли
+скорректировать стандартными преобразованиями а-ля log/sqrt и
+рекомендованными тестами Бокса-Кокса и Бокса-Тидвелла, (3)
+ненормальность остатков. Кроме того, как мы увидели еще на стадии
+"Анализ аутлаеров" аутлаеры по cook's distance склонны к крайним
+значениям ауткама (см. графики ниже).\
+Также мы должны помнить о специфичной группе наблюдений высоким рычагом,
+часть из которых мы удалили после стадии "Анализ аутлаеров". Суды по
+распределению ниже они также сконцентрированы в тяготеют к крайним
+значениям, а также показывают больший скос влево.
+
+С учетом важности крайних значений и аутлаеров (as suggested by Waldmann
+E. Quantile regression: A short story on how and why // Statistical
+Modelling. 2018. Vol. 18. No 3-4. P. 203-218.) следует попробовать
+квантильную регрессию.
+
+```{r}
+hist(russ_wvs_with_leverages[is_cookd_out == 1, ]$finance_satisfaction)
+hist(russ_wvs_with_leverages[is_cookd_out == 0, ]$finance_satisfaction)
+
+hist(russ_wvs_with_leverages[is_lever_out == 1, ]$finance_satisfaction)
+hist(russ_wvs_with_leverages[is_lever_out == 0, ]$finance_satisfaction)
+```
+
+### Квантильная регрессия
+
+checkpoint - 2
+
+save(russ_wvs, file = "russ_wvs2.rdata") \#
+load("/Users/viktorledenev/Desktop/EU - courses/Kolich -
+2/Midterm/russ_wvs2.rdata")
+
+## Выбор квантилей
+
+Нас точно интересовали крайние значения из-за относительной частоты
+аутлаеров по cook's distance среди них, но необходимо заново проверить
+распределение.
+
+```{r}
+prop.table(table(russ_wvs$finance_satisfaction))*100
+```
+
+Попробуем два подхода: один с обособленными квантилями для экстремальных
+значений и один на каждые 10% наблюдений (это поможет нам проверить
+наличие риска того, что нам не хватит экстремальных значений ауткама +
+различные значения ауткама +- близки к десятипроцентным группам).
+
+Кроме того, проверим квантильные модели без преобразованной
+hardwork_over_leisure, поскольку если мы делим на квантили, то,
+вероятно, преобразование утрачивает смысл.
+
+С трансформированной hardwork_over_leisure
+
+```{r}
+qm06 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.0607, weights = weights, data = russ_wvs)
+qm10 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.10, weights = weights, data = russ_wvs)
+qm20 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.20, weights = weights, data = russ_wvs)
+qm30 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.30, weights = weights, data = russ_wvs)
+qm40 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.40, weights = weights, data = russ_wvs)
+qm50 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.50, weights = weights, data = russ_wvs)
+qm60 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.60, weights = weights, data = russ_wvs)
+qm70 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.70, weights = weights, data = russ_wvs)
+qm80 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.80, weights = weights, data = russ_wvs)
+qm90 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.90, weights = weights, data = russ_wvs)
+qm95 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.9503, weights = weights, data = russ_wvs)
+```
+
+Без трансформированной hardwork_over_leisure
+
+```{r}
+qm_no_t06 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.0607, weights = weights, data = russ_wvs)
+qm_no_t10 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.10, weights = weights, data = russ_wvs)
+qm_no_t20 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.20, weights = weights, data = russ_wvs)
+qm_no_t30 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.30, weights = weights, data = russ_wvs)
+qm_no_t40 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.40, weights = weights, data = russ_wvs)
+qm_no_t50 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.50, weights = weights, data = russ_wvs)
+qm_no_t60 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.60, weights = weights, data = russ_wvs)
+qm_no_t70 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.70, weights = weights, data = russ_wvs)
+qm_no_t80 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.80, weights = weights, data = russ_wvs)
+qm_no_t90 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.90, weights = weights, data = russ_wvs)
+qm_no_t95 <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = 0.9503, weights = weights, data = russ_wvs)
+```
+
+## Сравнение моделей
+
+Для сравнения квантильных моделей мы можем использовать только критерий
+Акаике (BIC не работает, R\^2 не применим).
+
+```{r}
+models_full_data_with_transf <- list(qm06, qm10, qm20, qm30, qm40, qm50, qm60, qm70, qm80, qm90, qm95, sel_model_se_huber)
+sapply(models_full_data_with_transf, function(x) AIC(x)[1])
+which.min(sapply(models_full_data_with_transf, function(x) AIC(x)[1]))
+```
+
+```{r}
+models_full_data_no_transf <- list(qm_no_t06, qm_no_t10, qm_no_t20, qm_no_t30, qm_no_t40, qm_no_t50, qm_no_t60, qm_no_t70, qm_no_t80, qm_no_t90, qm_no_t95, sel_model_se_huber)
+sapply(models_full_data_no_transf, function(x) AIC(x)[1])
+which.min(sapply(models_full_data_no_transf, function(x) AIC(x)[1]))
+```
+
+```{r}
+sapply(models_full_data_with_transf, function(x) AIC(x)[1]) < sapply(models_full_data_no_transf, function(x) AIC(x)[1])
+```
+
+По единственному показателю для сравнения моделей обычная модель, без
+какого-либо квантильного деления лучше. В любом случае нам все еще
+интересны экстремальные значения ауткама. Соответственно, мы
+воспользуемся квантильной регрессией для изучения этих значений.
+
+Иначе как для двух последних выделенных нами квантилей преобразование
+hardwork_over_leisure сохраняет смысл. С учетом этого проверим обе
+группы моделей далее.
+
+### Анализ крайних значений ауткама в квантильной модели
+
+```{r}
+seq1 <- c(0.0607, seq(0.1, 0.9, by = 0.1), 0.9503)
+```
+
+## Модель с трансформированной hardwork_over_leisure
+
+```{r}
+qm_full_with_transf <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + I(hardwork_over_leisure^-1) + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = seq1, weights = weights, data = russ_wvs)
+```
+
+```{r}
+summary(qm_full_with_transf) %>% 
+  plot()
+```
+
+```{r}
+tab_model(qm06, qm10, qm50, qm90, qm95, sel_model_se_huber, show.aic = T, show.ci = 0.95,
+  dv.labels = c("06","10", "50", "90", "95", "No quant"))
+```
+
+```{r}
+plot_models(qm06, qm95, sel_model_se_huber,
+            show.values = TRUE,
+            m.labels = c("06", "95", "LM"), 
+            legend.title = "Model type")
+```
+
+## Модель с нетрансформированной hardwork_over_leisure
+
+```{r}
+qm_fullno_transf <- rq(finance_satisfaction ~ child_number_factor + job_career_oriented + has_higher_edu + hardwork_important + hardwork_over_leisure + trust_to_nonames + freerid_just + ind_vs_gov_responsible * post_soviet_child + post_soviet_child, tau = seq1, weights = weights, data = russ_wvs)
+```
+
+```{r}
+summary(qm_fullno_transf) %>% 
+  plot()
+```
+
+```{r}
+tab_model(qm_no_t06, qm_no_t10, qm_no_t50, qm_no_t90, qm_no_t95, sel_model_se_huber, show.aic = T, show.ci = 0.95,
+  dv.labels = c("06","10", "50", "90", "95", "No quant"))
+```
+
+```{r}
+plot_models(qm_no_t06, qm_no_t95, sel_model_se_huber,
+            show.values = TRUE,
+            m.labels = c("06", "95", "LM"), 
+            legend.title = "Model type")
+```
+
+На максимальных значениях финансовой удовлетворенности (95 квантиль)
+негативный эффект высшего образования практически пропадает (он в целом
+постепенно исчезает от квантиля к квантилю). Кроме того, на
+экстремальных значениях финансовой удовлетворенности (6 и 95 квантили)
+по-разному проявляется эффект превалирования труда над отдыхом: он
+больше на максимальных значениях финансовой удовлетворенности. В обоих
+случаях мы не можем говорить о значимости эффекта, поскольку
+доверительные интервалы для обоих указанных предикторов для крайних
+квантилей пересекаются, но тем не менее пересечение мало, а эффект
+высшего образования проявляется на переходе от квантиля к квантилю.
+
+### Интерпретация итоговой модели
+
+```{r}
+final_model <- sel_model_se_huber
+
+final_model_no_transfomation <- rlm(finance_satisfaction ~ child_number_factor + job_career_oriented + 
+    has_higher_edu + hardwork_important + hardwork_over_leisure + 
+    trust_to_nonames + freerid_just + ind_vs_gov_responsible * 
+    post_soviet_child + post_soviet_child, data = russ_wvs, weights = weights, 
+    psi = psi.huber)
+```
+
+```{r}
+tab_model(final_model)
+```
+
+```{r}
+russ_wvs[, finance_satisfaction_fit := final_model$fitted.values]
+russ_wvs[, finance_satisfaction_fit_no_transf := final_model_no_transfomation$fitted.values]
+```
+
+## Важность трудолюбия
+
+```{r}
+ggplot(russ_wvs, aes(x = hardwork_important, y = finance_satisfaction_fit))+
+  geom_boxplot(color = "red", alpha = 1) +
+  theme_bw() + 
+  geom_boxplot(aes(x = hardwork_important, y = finance_satisfaction), color = "black", alpha = 0.1, position = position_nudge(x = 0.05))
+```
+
+Q9 Important child qualities: Hard work \# 1 - yes \# 2 - no (not
+mentioned)
+
+Было на стадии "Простые статтесты с визуализацией": Мы наблюдаем
+статистически значимую разницу в средних значениях удовлетворенности
+финансовым положением между теми, кто считает важным прививать
+трудолюбие детям и наоборот: средняя удовлетворенность для первых ниже.
+
+При условии контроля на переменные в модели мы наблюдаем эффект в том же
+направлении, однако он перестал быть статистически значимым.
+
+Эффект парадоксален, однако не является статистически значимым.
+Возможное объяснение аналогично пункту (2) далее при анализе
+hardwork_over_leisure.
+
+## Превалирование труда над отдыхом
+
+```{r}
+ggplot(russ_wvs, aes(x = as.factor(hardwork_over_leisure), y = finance_satisfaction_fit))+
+  geom_boxplot(color = "red", alpha = 1) +
+  theme_bw() + 
+  geom_boxplot(aes(x = as.factor(hardwork_over_leisure), y = finance_satisfaction), color = "black", alpha = 0.1, position = position_nudge(x = 0.05))
+
+ggplot(russ_wvs, aes(x = as.factor(hardwork_over_leisure), y = finance_satisfaction_fit_no_transf))+
+  geom_boxplot(color = "red", alpha = 1) +
+  theme_bw() + 
+  geom_boxplot(aes(x = as.factor(hardwork_over_leisure), y = finance_satisfaction), color = "black", alpha = 0.1, position = position_nudge(x = 0.05))
+
+```
+
+Q41 Work should always come first even if it means less spare time \#
+increasing from leisure only to hardwork only \# 5 levels
+
+Было на стадии "Простые статтесты с визуализацией": незначимая небольшая
+по размеру в целом позитивная связь, спадающая под конец. При 3 и 4 по
+hardwork_over_leisure есть большее "расслоение": у небольшой группы
+наблюдений с 3 и 4 уровнем согласия есть относительно высокий уровень
+удовлетворенности.
+
+При условии контроля на переменные в модели мы наблюдаем более линейный
+эффект. Эффект в целом положительный (коэффициент интерпретируем с
+учетом трансформации) и статистически значимый. Однако дугообразность
+связи осталась. К срединному отношению к превалированию труда над
+отдыхом финудовлетворенность растет, а потом немного спадает. Уменьшение
+дугообразности, видимо, следует приписать не трансформации предиктора
+(см. график с предсказанными значениями из модели без трансформации
+finance_satisfaction_fit_no_transf), а контрольным переменным.
+
+Возможным объяснением дугообразности связи является: (1) в целом
+трудолюбие увеличивает готовность трудиться, что увеличивает доход, что
+увеличивает удовлетворенность финположением, (2) однако идея о
+необходимости регулярного труда может наибольшим образом возникать в
+социальных группах, в которых постоянный труд является наиболее
+необходимым, то есть у наиболее бедных слоев населения. Отчасти это
+подтверждается анализом в рамках квантильной регрессии: на экстремально
+низких значениях финансовой удовлетворенности (6 квантиль) эффект
+превалирования труда над отдыхом: он в среднем ниже на минимальных
+значениях финансовой удовлетворенности (однако доверительные интервалы
+пересекаются, поэтому это слабый довод).
+
+Также мы видели повышенный коэффициент превалирования труда над отдыхом
+у тех, кто наиболее удовлетворен финположением. Вероятно, это
+объясняется тем, что такие люди чаще являются богатыми и склонны верить,
+что их успех - результат их усилий и постоянного труда.
+
+## Доверие незнакомцам
+
+```{r}
+ggplot(russ_wvs, aes(x = as.factor(trust_to_nonames), y = finance_satisfaction_fit))+
+  geom_boxplot(color = "red", alpha = 1) +
+  theme_bw() + 
+  geom_boxplot(aes(x = as.factor(trust_to_nonames), y = finance_satisfaction), color = "black", alpha = 0.1, position = position_nudge(x = 0.05))
+```
+
+Q61 Trust: People you meet for the first time \# 0 - do not trust or
+almost do not trust; 1 - almost and completely trust
+
+Было на стадии "Простые статтесты с визуализацией": Мы наблюдаем
+статистически значимую разницу в средних значениях удовлетворенности
+финансовым положением между теми, кто склонен доверять впервые
+встреченным людям и наоборот: средняя удовлетворенность для первых выше.
+
+При условии контроля на переменные в модели мы наблюдаем аналогичный
+статистически значимый эффект: склонность не доверять незнакомцам в
+среднем уменьшают финансовую удовлетворенность на 0.5 пункта. Хотя при
+контроле разница между медиананными значениями была несколько сглажена,
+в целом мы видим, что эффект остается.
+
+Эффект противоречит нашей первоначальной гипотезе. Возможным объяснением
+могло бы быть то, что более доверчивые люди чаще подвергаются изъятию
+активов против воли, что делает их менее богатым, но это маловероятно,
+поскольку имущественные преступления не так распространены. Для более
+удачного объяснения требуется более детальное рассмотрение характеристик
+"доверчивых" наблюдений.
+
+## Ответственность за граждан: государство vs индивид
+
+```{r}
+ggplot(russ_wvs, aes(x = ind_vs_gov_responsible, y = finance_satisfaction_fit))+
+  geom_point(color = "red", alpha = 1) +
+  theme_bw() + 
+  geom_smooth(method = "lm", color = "red") +
+  geom_smooth(method = "lm", aes(x = ind_vs_gov_responsible, y = finance_satisfaction), color = "black", alpha = 0.5)
+```
+
+Q108 Government´s vs individual´s responsibility \# increasing from the
+goverment's to an individual's responsibility \# 10 levels
+
+Было на стадии "Простые статтесты с визуализацией": Мы наблюдаем
+статистически значимую связь возложения ответственности на индивида с
+государства и роста финансовой удовлетворенности. При этом эффект,
+кажется, не совсем линейный, поскольку в последней категории, с полной
+ответственностью индивида,крайние значения учащаются.
+
+При условии контроля на переменные в модели эффект сохраняет
+направление, однако становится статистически незначимым. Кроме того,
+несколько меняется размер коэффициента, что видно визуально: он ниже
+скорее патерналистских респондентах, но выше на скорее индивидуалистски
+ориентированных индивидах. Это, вероятно, связано с тем, что индивиды,
+ощущающие меньшую финансовую удовлетворенность ожидают большую внешнюю
+помощь, со стороны государства. Либо индивиды, склонные перекладывать
+ответственность на государствено, склонны предпринимать меньше усилий.
+Однако с контролем на прокси приложения усилий, то есть образование,
+трудолюбие как ценность и т.д., мы не наблюдаем существенного изменения
+силы эффекта, поэтому скорее всего это объяснение маловероятно.
+
+Тем не менее эффект незначим, поэтому мы не можем говорить о
+генерализации выводов из него.
+
+## Интеракция: рождение после 1987 года и ответственность за граждан: государство vs индивид
+
+```{r}
+ggplot(russ_wvs, aes(x = ind_vs_gov_responsible, y = finance_satisfaction_fit, color = post_soviet_child))+
+  geom_point() +
+  theme_bw() + 
+  geom_smooth(method = "lm") +
+  geom_smooth(method = "lm", aes(x = ind_vs_gov_responsible, y = finance_satisfaction, color = post_soviet_child), alpha = 0.5)
+```
+
+Мы видим, что эффект возложения ответственности на государство
+практически не наблюдается для пост-советского поколения. Вероятно, это
+вызвано не тем, что бедные ждут от государства помощи, а установками
+советских граждан об огромной роли государственного патернализма. А
+некогда советские граждане старше, в связи с чем реже работают, а потому
+имеют меньше доход и ниже финансовую удовлетворенность.
+
+## Оправданность проезда зайцем
+
+```{r}
+ggplot(russ_wvs, aes(x = freerid_just, y = finance_satisfaction_fit))+
+  geom_point(color = "red", alpha = 1) +
+  theme_bw() + 
+  geom_smooth(method = "lm", color = "red") +
+  geom_smooth(method = "lm", aes(x = freerid_just, y = finance_satisfaction), color = "black", alpha = 0.5)
+```
+
+Q178 Justifiable: Avoiding a fare on public transport \# increasing \#
+10 levels
+
+Было на стадии "Простые статтесты с визуализацией": Мы не наблюдаем
+статистически значимую связь оправданности проезда зайцем и роста
+финансовой удовлетворенности. При этом эффект, кажется, не совсем
+линейный, поскольку в последней категории, с полной допустимостью,
+крайняя неоправданность учащается.
+
+При условии контроля на переменные в модели эффект сохраняет направление
+и даже немного ослабевает, однако становится статистически значимым: с
+одним шагом по шкале в сторону от неодобрения проезда зайцем финансовая
+неудовлетворенность падает в среднем на 1/20 шага. Это противоречит
+нашей изначальной гипотезе о склонности к пренебрежению публичным
+интересом как факторе, способствующем увеличению дохода. Нам сложно
+сказать, что российское государство успешно решает проблему фрирайдинга
+в самом широком смысле. Поэтому более вероятным объяснением является
+более высокая необходимость "держать лицо", в том числе перед
+интервьюером, у более обеспеченных лиц, для которых репутация может быть
+активом, а демонстрация недостаточной обеспеченности, чтобы оплатить
+общественный транспорт, - вызывать стыд. Вероятно, мы избрали неудачное
+прокси.
+
+## Число детей
+
+```{r}
+ggplot(russ_wvs, aes(x = child_number_factor, y = finance_satisfaction_fit))+
+  geom_boxplot(color = "red", alpha = 1) +
+  theme_bw() + 
+  geom_boxplot(aes(x = child_number_factor, y = finance_satisfaction), color = "black", alpha = 0.1, position = position_nudge(x = 0.05))
+```
+
+Было на стадии "Простые статтесты с визуализацией": Мы наблюдаем
+статистически значимые разницы в средних значениях удовлетворенности
+финансовым положением в зависимости от числа детей по 4 категориям.
+Однако связи незначимы между бездетными и людьми с 1 ребенком, а также
+людьми с 3+ и 2 детьми. С ростом числа детей было связано уменьшение
+финансовой удовлетворенности.
+
+Визуализация эффекта подтверждает направление связи и при контроле,
+однако связь является статистически незначимой. Более того,
+примечательно, что незначимый эффект все же положителен: то есть,
+возмонжо, случайно, но обладатели одного или двух детей в целом могут
+быть более финансово удовлетворенными, чем люди без детей на 0.22 и 0.14
+шага.
+
+## Карьерно-ориентированный рабочий статус
+
+```{r}
+ggplot(russ_wvs, aes(x = job_career_oriented, y = finance_satisfaction_fit))+
+  geom_boxplot(color = "red", alpha = 1) +
+  theme_bw() + 
+  geom_boxplot(aes(x = job_career_oriented, y = finance_satisfaction), color = "black", alpha = 0.1, position = position_nudge(x = 0.05))
+```
+
+Q279 Employment status 1.- Full time (30 hours a week or more) 2.- Part
+time (less than 30 hours a week) 3.- Self employed 4.- Retired/pensioned
+5.- Housewife not otherwise employed 6.- Student 7.- Unemployed
+
+1, 3, 6 - career oriented status
+
+Было на стадии "Простые статтесты с визуализацией": Мы наблюдаем
+статистически значимую разницу в средних значениях удовлетворенности
+финансовым положением между теми, кого обозначили
+карьерно-ориентированными (фул-тайм, студенты, самозанятые) и наоборот:
+средняя удовлетворенность для первых выше.
+
+При условии контроля на переменные в модели эффект отсутствия
+карьерно-ориентированного статуса остается статистически значимым и
+негативным В среднем его отсутствие снижает финансовую удовлетворенность
+на 0.67 шага по шкале. Это объясняется тем, что труд приносит доход.
+
+## Наличие высшего образования
+
+```{r}
+ggplot(russ_wvs, aes(x = has_higher_edu, y = finance_satisfaction_fit))+
+  geom_boxplot(color = "red", alpha = 1) +
+  theme_bw() + 
+  geom_boxplot(aes(x = has_higher_edu, y = finance_satisfaction), color = "black", alpha = 0.1, position = position_nudge(x = 0.05))
+```
+
+Высшее образование: бакалавриат, специалитет и выше.
+
+Было на стадии "Простые статтесты с визуализацией": Мы наблюдаем
+статистически значимую разницу в средних значениях удовлетворенности
+финансовым положением между теми, у кого есть высшее образование и
+наоборот: средняя удовлетворенность для первых выше.
+
+При условии контроля на переменные в модели эффект отсутствия высшего
+образования является статистически значимым и негативным. С отсутствием
+высшего образования связано падение финансовой удовлетворенности на 0.32
+шага по шкале.
+
+## Рождение после 1987 года
+
+```{r}
+ggplot(russ_wvs, aes(x = post_soviet_child, y = finance_satisfaction_fit))+
+  geom_boxplot(color = "red", alpha = 1) +
+  theme_bw() + 
+  geom_boxplot(aes(x = post_soviet_child, y = finance_satisfaction), color = "black", alpha = 0.1, position = position_nudge(x = 0.05))
+```
+
+Было на стадии "Простые статтесты с визуализацией": Мы наблюдаем
+статистически значимую разницу в средних значениях удовлетворенности
+финансовым положением между теми, кто родился после 1987 года и
+наоборот: средняя удовлетворенность для первых выше.
+
+При условии контроля на переменные в модели эффект остался положительным
+и статистически значимым. Вероятным объяснением этого является то, что
+рождение в пост-советское время пересекается для большинства наблюдений
+с пиком деловой активности и роста доходов. Не надо было убирать
+контроль на возраст, чтобы это проверить (на разнице коэффициентов для
+возраста у пост- и советских респондентов).
+
+## Выбывшие из модели переменные
+
+Пол, необходимость воспитания в детях настойчивость, брачный статус и
+возраст были выкинуты из модели, что было во-многом ошибкой. Вероятно,
+при контроле мы увидели бы иные эффекты.
+
+sex perseverance age marriage_history
