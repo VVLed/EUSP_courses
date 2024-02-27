@@ -1,6 +1,6 @@
 ---
-title: "Ledenev_Midterm"
-author: "VLedenev"
+title: "Midterm"
+author: "Author"
 output: 
     html_document:
            toc: TRUE
