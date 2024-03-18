@@ -1,3 +1,9 @@
+###
+# Midterm project for the course on Quantitative Methods - 2.
+# Thoroughly written (non-)linear and quantile regression models.
+# We predict if hard-working is worth doing.
+# Data: World Value Survey
+
 ---
 title: "Midterm"
 author: "Author"
