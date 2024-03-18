@@ -1,0 +1,874 @@
+### 
+# A bit boring final project on Victimology course.
+# Just meticulous descriptive analysis of primarily categorical data.
+# We analyse if Russian repeated victims have any traits which contradict to the current literature. 
+# Data: RCVS 2021 
+---
+output: 
+    html_document:
+           toc: TRUE
+           toc_float:
+                collapsed: TRUE
+                smooth_scroll: TRUE
+           toc_depth: 2
+           number_sections: FALSE
+date: "2023-12-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(haven)
+library(data.table)
+library(naniar)
+library(ggplot2)
+library(gmodels)
+```
+
+
+
+
+### Подготовка данных
+```{r}
+rcvs_2021 <- read_sav("/Users/viktorledenev/Desktop/EU - courses/Victim/final_project/rcvs_2021_dataset_2022-06-30.sav")
+rcvs_2021 <- as.data.table(rcvs_2021)
+uniqueN(rcvs_2021$ID) == nrow(rcvs_2021) # TRUE => each row one crime and one victim disregarding repeat of victimization
+```
+
+## Проверка качества данных о предполагаемых жертвах
+
+Отбор с нашей стороны привел нас к тому, что мы определили жертв аналогично авторам датасета, согласно созданной ими переменной resp_is_crime_victim. Соответственно, для ускорения можно перейти сразу на шаг "Определение повторных жертв".
+
+Как распределены между собой ответы на вопросы о том, были ли респонденты виктимизированы
+```{r}
+table(rcvs_2021$Q75, rcvs_2021$Q76)
+```
+Мы видим неразбериху в соотношении категорий между собой. Те, кто говорит о том, что ничего не было за 5 лет или затрудняются ответить (Q75 = 2 или 3) могут говорить, что такое было за 12 месяцев или затрудняются ответить (Q76 == 1 или 3). И наоборот.
+
+Выделим спорные наблюдения.
+
+```{r}
+victims_to_check <- rcvs_2021[Q75 %chin% c(2, 3) & Q76 %chin% c(1, 3), ]
+```
+
+При ручном обзоре (View(victims_to_check)) мы видим, что спорные наблюдения в иногда склонны давать характеристику преступлений, что наводит на мысль, что преступления были. Для точности и простоты сверимся с классификацией от авторов датасета (переменная resp_is_crime_victim).
+
+```{r}
+table(victims_to_check$Q75, victims_to_check$resp_is_crime_victim)
+
+table(victims_to_check$Q76, victims_to_check$resp_is_crime_victim)
+```
+
+Авторы датасета не относят к жертвам преступлений 21+33=54 и 54 наблюдения. Проверим их вручную.
+
+```{r}
+victims_to_check1 <- victims_to_check[Q75 %chin% c(2, 3) & resp_is_crime_victim == 0, ]
+
+vis_miss(victims_to_check1)
+
+table(victims_to_check1$Q75, victims_to_check1$Q76)
+```
+
+Эти респонденты не дают никакие ответы на вопросы о преступлении => мы можем их не считать жертвами преступлений.
+
+```{r}
+ID_to_delete <- unique(victims_to_check1$ID)
+length(ID_to_delete)
+
+victims_to_check <- victims_to_check[!ID %chin% ID_to_delete, ]
+```
+
+```{r}
+vis_miss(victims_to_check)
+IDs_of_disp_victims <- unique(victims_to_check$ID)
+```
+
+От этих респондентов получена информация о преступлениях - сохраним их. 
+
+
+## Определение жертв
+
+```{r}
+rcvs_2021[, is_victim := fifelse(Q75 == 1 | resp_is_crime_victim == 1 | ID %chin% IDs_of_disp_victims, 1, 0)]
+table(rcvs_2021$is_victim, rcvs_2021$resp_is_crime_victim)
+```
+
+Определили аналогично авторам датасета.
+
+Очистим среду и датасет от лишнего.
+```{r}
+rm(victims_to_check, victims_to_check1)
+rcvs_2021[, is_victim := NULL]
+```
+
+
+
+## Проверка переменной о повторности виктимизации
+
+Проверим соотношение двух переменных о числе виктимизаций за 5 лет и 1 год соответственно между собой.
+
+Перед этим перекодируем NA в вопросах о числе виктимизаций на ноль.
+```{r}
+rcvs_2021[, Q75_1N := ifelse(is.na(Q75_1N) == TRUE, 0, Q75_1N)]
+rcvs_2021[, Q76_1N := ifelse(is.na(Q76_1N) == TRUE, 0, Q76_1N)]
+```
+
+
+```{r}
+n_of_victimizations <- rcvs_2021[, .(diff = Q75_1N - Q76_1N, ID)]
+
+table(n_of_victimizations$diff, useNA = "ifany")
+```
+
+Мы видим наблюдения, в которых (1) число виктимизаций за год превышает число виктимизаций за 5 лет; (2) число виктимизаций является аномально высоким (например, более тысячи).
+
+В первом случае, видимо, все можно, вероятно, списать на то, что респонденты не сразу поняли суть вопроса, поэтому такие наблюдения мы рискнем оставить. Однако для удобства расчетов в этом случае будем считать число виктимизаций за 5 лет равна числу виктимизаций за год.
+
+```{r}
+rcvs_2021[, Q75_1N := fifelse(Q75_1N < Q76_1N, Q76_1N, Q75_1N)]
+```
+
+
+Во втором случае мы получаем аутлаеры. Мы не можем исключать экстремально частые виктимизации, однако они могут внести искажения в анализ. Поскольку на данном этапе предполагается использование только бивариантных тестов, но не построение регрессионной модели, мы не сможем проверить влияние аутлаеров на статистические расчеты через их leverage/cook's distance, чтобы исключить выбросы точечно. В этой связи мы удалим наиболее радикальные "на глаз" аутлаеры.
+
+
+```{r}
+table(rcvs_2021[Q75_1N > 0, ]$Q75_1N)
+sum((prop.table(table(rcvs_2021[Q75_1N > 0, ]$Q75_1N))*100)[16:37])
+```
+
+Респонденты с более, чем 20 виктимизациями составляют `r sum((prop.table(table(rcvs_2021[Q75_1N > 0, ]$Q75_1N))*100)[16:37])`% от всех жертв.
+
+С учетом "пикового" числа значений на 10, 20, 30, 50, 100 видимо, эти значения представляет собой референтную точку для тех, кто точно не помнит про число виктимизаций. Это говорит о частичной правдоподобности ответов, которые говорят о наиболее экстремальной частоте виктимизации. Тем не менее в рамках бивариантных тестов мы не сможем учесть аутлаеры, поэтому мы удалим данные значения, обозначив соответствующее ограничения нашего анализа.
+
+```{r}
+table(rcvs_2021[Q76_1N > 0, ]$Q76_1N)
+sum((prop.table(table(rcvs_2021[Q76_1N > 0, ]$Q76_1N))*100)[11:19])
+```
+
+Мы не мы видим столь явных пиков на округленных значениях, но можем отметить, что "серийные" жертвы с более, чем 10 виктимизациями составляют всего `r sum((prop.table(table(rcvs_2021[Q76_1N > 0, ]$Q76_1N))*100)[11:19])`% жертв. По причинам аналогичным указанным выше мы предпочтем отрезать эти экстремальные значения.
+
+
+```{r}
+rcvs_2021_final <- rcvs_2021[Q75_1N <= 20 & Q76_1N <= 10, ]
+```
+
+## Выделяем повторяющиеся жертвы
+
+```{r}
+rcvs_2021_final[Q75_1N != 0 & is.na(Q75_1N) == FALSE, is_repeat_victim := fifelse(Q75_1N > 1, 1, 0)]
+rcvs_2021_final[, is_repeat_victim := as.factor(is_repeat_victim)]
+```
+
+
+## Классификация преступлений
+
+```{r}
+table(rcvs_2021_final$crime_type)
+rcvs_2021_final[, crime_type := as.character(crime_type)]
+rcvs_2021_final[is.na(crime_type) == FALSE, crime_type := 
+  ifelse (crime_type == "1", "Assault", 
+  ifelse(crime_type == "2", "Burglary",
+  ifelse(crime_type == "3", "Theft", 
+  ifelse(crime_type == "4", "Fraud", 
+  ifelse(crime_type == "5", "Remote", 
+  ifelse(crime_type == "6", "Attempt of remote", 
+  ifelse(crime_type == "7", "Other", "No info")))))))]            
+table(rcvs_2021_final$crime_type)
+```
+
+### Перекодировка переменных
+
+## Бинарные переменные вида преступления
+
+```{r}
+rcvs_2021_final[is.na(crime_type) == FALSE, crime_is_assault := fifelse(crime_type == "Assault", 1, 0)]
+rcvs_2021_final[is.na(crime_type) == FALSE, crime_is_burglary := fifelse(crime_type == "Burglary", 1, 0)]
+rcvs_2021_final[is.na(crime_type) == FALSE, crime_is_theft := fifelse(crime_type == "Theft", 1, 0)]
+```
+
+## Бинарная переменная преступления на улице
+
+```{r}
+rcvs_2021_final[, crime_place_street := fifelse(crime_place_grouped == 2, 1, 0)]
+```
+
+## Сгруппированный СЭС
+```{r}
+table(rcvs_2021_final$resp_ses)
+rcvs_2021_final[is.na(resp_ses) == FALSE, resp_ses_grouped := ifelse(resp_ses == 4 | resp_ses == 5 | resp_ses == 6, 4, resp_ses)]
+table(rcvs_2021_final$resp_ses_grouped)
+```
+
+## Бинаризация ощущения безопасности
+
+```{r}
+table(rcvs_2021_final$Q81)
+rcvs_2021_final[is.na(Q81) == FALSE, subj_safe := 
+  fifelse(Q81 == 5, 1,
+  fifelse( Q81 == 4, 2,
+  ifelse(Q81 == 3, NA, 
+  fifelse(Q81 == 2, 5, 4))))]
+table(rcvs_2021_final$subj_safe)
+```
+
+```{r}
+hist(rcvs_2021_final$subj_safe) 
+```
+
+С учетом явного превалирования тех, кто считает свой район безопасным попробуем бинаризовать.
+
+```{r}
+rcvs_2021_final[is.na(subj_safe) == FALSE, subj_safe := 
+  fifelse(subj_safe == 1 | subj_safe == 2, 0, 1)]
+table(rcvs_2021_final$subj_safe)
+```
+
+
+## Бинаризованная степень знакомства с преступником
+```{r}
+rcvs_2021_final[is.na(offender_relationship_grouped) == FALSE, offender_relationship_binary := ifelse(offender_relationship_grouped == 6, 0, 1)]
+```
+
+
+```{r}
+nrow(rcvs_2021_final)
+```
+
+```{r}
+uniqueN(rcvs_2021_final[Q75_1N > 0, ]$ID); uniqueN(rcvs_2021_final[Q75_1N > 1, ]$ID)
+uniqueN(rcvs_2021_final[Q75_1N > 0 & crime_is_assault, ]$ID); uniqueN(rcvs_2021_final[Q75_1N > 1 & crime_is_assault, ]$ID)
+uniqueN(rcvs_2021_final[Q75_1N > 0 & crime_is_burglary, ]$ID); uniqueN(rcvs_2021_final[Q75_1N > 1 & crime_is_burglary, ]$ID)
+uniqueN(rcvs_2021_final[Q75_1N > 0 & crime_is_theft, ]$ID); uniqueN(rcvs_2021_final[Q75_1N > 1 & crime_is_theft, ]$ID)
+```
+
+
+### Бивариантные тесты и визуализация
+
+
+## Время суток
+
+Q15  Это произошло в светлое или темное время суток? 
+1: Светлое
+
+Визуализация в целом
+
+```{r}
+ggplot(rcvs_2021_final[Q15 != 3, ], aes(x = Q15, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Мы не наблюдаем различий.
+
+Визуализация по типу преступлений
+
+```{r}
+ggplot(rcvs_2021_final[Q15 != 3, ], aes(x = Q15, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap(~crime_type)
+```
+
+Видим большую частоту повторяющихся жертв для грабежей/разбоев днем и меньшую - для мошенничеств и краж ночью.
+
+
+
+Проверим допущение о том, что ожидаемые значения не должны быть меньше 5.
+```{r}
+chisq.test(rcvs_2021_final[Q15 != 3, ]$is_repeat_victim, rcvs_2021_final[Q15 != 3, ]$Q15)$expected
+chisq.test(rcvs_2021_final[Q15 != 3 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q15 != 3 & crime_is_assault == 1, ]$Q15)$expected
+chisq.test(rcvs_2021_final[Q15 != 3 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q15 != 3 & crime_is_burglary == 1, ]$Q15)$expected
+chisq.test(rcvs_2021_final[Q15 != 3 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q15 != 3 & crime_is_theft == 1, ]$Q15)$expected
+```
+
+Все ок.
+
+```{r}
+chisq.test(rcvs_2021_final[Q15 != 3, ]$is_repeat_victim, rcvs_2021_final[Q15 != 3, ]$Q15)$p.value
+chisq.test(rcvs_2021_final[Q15 != 3 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q15 != 3 & crime_is_assault == 1, ]$Q15)$p.value
+chisq.test(rcvs_2021_final[Q15 != 3 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q15 != 3 & crime_is_burglary == 1, ]$Q15)$p.value
+chisq.test(rcvs_2021_final[Q15 != 3 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q15 != 3 & crime_is_theft == 1, ]$Q15)$p.value
+```
+Мы наблюдаем статистическую значимую связь применительно к краже и к грабежу/разбою.
+
+```{r}
+chisq.test(rcvs_2021_final[Q15 != 3 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q15 != 3 & crime_is_burglary == 1, ]$Q15)$stdres
+chisq.test(rcvs_2021_final[Q15 != 3 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q15 != 3 & crime_is_theft == 1, ]$Q15)$stdres
+```
+
+Видим практически статистически значимые эффекты: большую частоту повторяющихся жертв для грабежей/разбоев днем и меньшую - для краж ночью.
+
+
+## Нахождение одному в темное время суток
+
+Q18 Были ли в этот момент рядом с Вами другие люди? 1: Да
+
+```{r}
+ggplot(rcvs_2021_final[Q18 != 3 & Q15 == 2, ], aes(x = Q18, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Видим, что доля повторяющихся жертв в целом выше для одиноких жертв ночных преступлений.
+
+
+```{r}
+ggplot(rcvs_2021_final[Q18 != 3 & Q15 == 2, ], aes(x = Q18, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap(~crime_type)
+```
+
+Видим, что пропорция повторяющихся жертв выше среди одиноких жертв ночных нападений, грабежей/разбоев и мошенничеств. Немного заметна обратная связь для краж.
+
+
+Проверим допущение о том, что ожидаемые значения не должны быть меньше 5.
+```{r}
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2, ]$Q18)$expected
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_assault == 1, ]$Q18)$expected
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_burglary == 1, ]$Q18)$expected
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_theft == 1, ]$Q18)$expected
+```
+
+Все ок.
+
+```{r}
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2, ]$Q18)$p.value
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_assault == 1, ]$Q18)$p.value
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_burglary == 1, ]$Q18)$p.value
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_theft == 1, ]$Q18)$p.value
+```
+
+Значимы эффекты для преступлений в целом, нападений и грабежей/разбоев.
+
+```{r}
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2, ]$Q18)$stdres
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_assault == 1, ]$Q18)$stdres
+chisq.test(rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q18 != 3 & Q15 == 2 & crime_is_burglary == 1, ]$Q18)$stdres
+```
+
+Видим статистически значимый эффект: большую частоту повторяющихся жертв для одиноких жертв ночных преступлений в целом, нападений и грабежей/разбоев.
+
+
+## Место преступления
+
+crime_place_grouped Место преступления (сгруппированное) 
+1: Квартира, дом, дача (в т.ч. в гостях)
+2: На улице, дороге, парковке, на природе
+3: Общественные здания (магазины, кафе, банки, поликлиники)
+4: На работе, учебе, в закрытых учреждениях
+5: В подъезде или во дворе
+6: На транспорте (в автомобиле, поезде, на вокзале)
+ 7: Невозможно сказать (напр., украли деньги с банковской
+карты)
+ 8: Затрудняюсь ответить / не помню
+ 
+
+```{r}
+ggplot(rcvs_2021_final[crime_place_grouped != 8, ], aes(x = crime_place_grouped, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Видим меньшую долю повторяющихся жертв для преступлений в общественных зданиях и большие для работы, учебы, подъездов, дворов, транспорта.
+
+```{r}
+ggplot(rcvs_2021_final[crime_place_grouped != 8, ], aes(x = crime_place_grouped, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap(~crime_type)
+```
+
+Видим большую вариацию для краж/разбоев, мошенничеств и краж, чуть меньшую для нападений.
+
+
+```{r}
+chisq.test(rcvs_2021_final[crime_place_grouped != 8, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8, ]$crime_place_grouped)$expected
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_assault == 1, ]$crime_place_grouped)$expected
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_burglary == 1, ]$crime_place_grouped)$expected
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_theft == 1, ]$crime_place_grouped)$expected
+```
+Для нападения и краж/разбоев допущение о том, что ожидаемые значения меньше 5 не должны составлять больше 20% частот, не соблюдаются => тест Фишера.
+
+```{r}
+chisq.test(rcvs_2021_final[crime_place_grouped != 8, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8, ]$crime_place_grouped)$p.value
+fisher.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_assault == 1, ]$crime_place_grouped)$p.value
+fisher.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_burglary == 1, ]$crime_place_grouped)$p.value
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_theft == 1, ]$crime_place_grouped)$p.value
+```
+Нет значимых связей места совершения преступления и повторной виктимизации.
+
+## Место преступления: улица как бинарная переменная
+
+```{r}
+ggplot(rcvs_2021_final[crime_place_grouped != 8, ], aes(x = crime_place_street, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Нет заметной разницы.
+
+```{r}
+ggplot(rcvs_2021_final[crime_place_grouped != 8, ], aes(x = crime_place_street, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap(~crime_type)
+```
+
+Есть повышенная пропорция повторяющихся жертв среди жертв нападений и грабежей/разбоев не на улице, а также сниженная для краж.
+
+```{r}
+chisq.test(rcvs_2021_final[crime_place_grouped != 8, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8, ]$crime_place_street)$expected
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_assault == 1, ]$crime_place_street)$expected
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_burglary == 1, ]$crime_place_street)$expected
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_theft == 1, ]$crime_place_street)$expected
+```
+
+Все ок.
+
+```{r}
+chisq.test(rcvs_2021_final[crime_place_grouped != 8, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8, ]$crime_place_street)$p.value
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_assault == 1, ]$crime_place_street)$p.value
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_burglary == 1, ]$crime_place_street)$p.value
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_theft == 1, ]$crime_place_street)$p.value
+```
+
+Есть значимый эффект для грабежей/разбоев.
+
+```{r}
+chisq.test(rcvs_2021_final[crime_place_grouped != 8 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[crime_place_grouped != 8 & crime_is_burglary == 1, ]$crime_place_street)$stdres
+```
+
+Видим статистически значимый эффект: меньшую частоту повторяющихся жертв для жертв уличных грабежей/разбоев относительно жертв грабежей/разбоев в других точках.
+
+
+## Трудовой статус
+
+resp_ses_grouped Социально-экономический статус (сгруппированный) 
+1: Безработный
+2: Пенсионер
+3: Студент
+4: Работает
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = resp_ses_grouped, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Видим небольшую позитивную связь повторяющейся виктимизации жертвы и ее безработицей/студенчеством.
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = resp_ses_grouped, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap(~crime_type)
+```
+
+Видим, что пенсионеры менее часто подвергаются нападениям, безработные грабежам/разбою (преимущественно рабочие), студенты кражам (преимущественно пенсионеры и рабочие).
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0, ]$resp_ses_grouped)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$resp_ses_grouped)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$resp_ses_grouped)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$resp_ses_grouped)$expected
+```
+
+
+Все ок, хотя для грабежей значения на грани => проверим их на тесте Фишера.
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0, ]$resp_ses_grouped)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$resp_ses_grouped)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$resp_ses_grouped)$p.value
+fisher.test(rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$resp_ses_grouped)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$resp_ses_grouped)$p.value
+```
+
+Значимый эффекти наблюдается только для нападений.
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$resp_ses_grouped)$stdres
+```
+
+Видим статистически значимый эффект: меньшую частоту повторяющихся жертв для пенсионеров, пострадавших от нападения, относительно остальных групп, пострадавших от нападения.
+
+
+## Отношения жертвы с преступником
+
+offender_relationship_grouped Отношения преступника и жертвы (сгруппированные) # Соотнести с "не видел/не знаю"
+1: Супруги и сожители
+2: Друзья и родственники
+3: Коллега
+4: Сосед или соседка
+5: Дальние и случайные знакомые
+6: Незнакомец
+
+```{r}
+ggplot(rcvs_2021_final, aes(x = offender_relationship_grouped, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Выоская доля повторяющихся жертв среди жертв насилия партнеров, друзей и родственников, коллег. 
+
+```{r}
+ggplot(rcvs_2021_final, aes(x = offender_relationship_grouped, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap (~crime_type)
+```
+
+Для нападений видим, что наибольшее число повторяющихся жертв среди жертв нападений от партнеров, друзей и родственников, минимально от соседей.
+
+```{r}
+chisq.test(rcvs_2021_final$is_repeat_victim, rcvs_2021_final$offender_relationship_grouped)$expected
+chisq.test(rcvs_2021_final[crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[crime_is_assault == 1, ]$offender_relationship_grouped)$expected
+chisq.test(rcvs_2021_final[crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[crime_is_burglary == 1, ]$offender_relationship_grouped)$expected
+```
+
+Для нападений обнаруживаем значения ниже 5, но их меньше 20% от всех частот => проверим дополнительно через тест Фишера. Для грабежей/разбоев требуется тест Фишера.
+
+```{r}
+chisq.test(rcvs_2021_final$is_repeat_victim, rcvs_2021_final$offender_relationship_grouped)$p.value
+chisq.test(rcvs_2021_final[crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[crime_is_assault == 1, ]$offender_relationship_grouped)$p.value
+fisher.test(rcvs_2021_final[crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[crime_is_assault == 1, ]$offender_relationship_grouped)$p.value
+chisq.test(rcvs_2021_final[crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[crime_is_burglary == 1, ]$offender_relationship_grouped)$p.value
+```
+
+Нет значимых эффектов.
+
+## Знакомство жертвы с преступником
+
+0 - незнакомец, 1 - известен
+
+```{r}
+ggplot(rcvs_2021_final, aes(x = offender_relationship_binary, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Больше повторяющихся жертв среди жертв преступлений со стороны знакомых.
+
+```{r}
+ggplot(rcvs_2021_final, aes(x = offender_relationship_binary, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap (~crime_type)
+```
+
+Для нападений и разбоев/грабежей видим такую же зависимость, хотя для нападения размер эффекта мизерный.
+
+
+
+```{r}
+chisq.test(rcvs_2021_final$is_repeat_victim, rcvs_2021_final$offender_relationship_binary)$expected
+chisq.test(rcvs_2021_final[crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[crime_is_assault == 1, ]$offender_relationship_binary)$expected
+chisq.test(rcvs_2021_final[crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[crime_is_burglary == 1, ]$offender_relationship_binary)$expected
+```
+
+Все ок.
+
+```{r}
+chisq.test(rcvs_2021_final$is_repeat_victim, rcvs_2021_final$offender_relationship_binary)$p.value
+chisq.test(rcvs_2021_final[crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[crime_is_assault == 1, ]$offender_relationship_binary)$p.value
+chisq.test(rcvs_2021_final[crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[crime_is_burglary == 1, ]$offender_relationship_binary)$p.value
+```
+
+Нет значимых эффектов.
+
+## Ощущение безопасности на районе
+
+0 - нет ощущения безопасности, 1 - есть
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = subj_safe, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+
+Среди жертв, которые чувствуют себя небезопасно, больше повторяющихся жертв.
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = subj_safe, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap(~crime_type)
+```
+
+Среди жертв всех видов преступлений кроме мошенничества, которые чувствуют себя небезопасно, больше повторяющихся жертв.
+
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0, ]$subj_safe)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$subj_safe)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$subj_safe)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$subj_safe)$expected
+```
+
+Все ок.
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0, ]$subj_safe)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$subj_safe)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$subj_safe)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$subj_safe)$p.value
+```
+Значимый эффект наблюдается только для преступности вообще и краж.
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0, ]$subj_safe)$stdres
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$subj_safe)$stdres
+```
+
+Видим статистически значимый эффект: большую частоту повторяющихся жертв среди тех, кто не чувствует себя безопасно в своем районе, относительно тех, кто такую безопасность ощущает.
+
+
+## Сопротивлялась ли жертва
+Q31 Оказывали ли Вы сопротивление преступнику? 1: Да, 2: Нет
+
+```{r}
+ggplot(rcvs_2021_final[Q31 != 3, ], aes(x = Q31, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Среди тех, кто сопротивлялся преступнику, пропорция повторяющихся жертв выше,
+
+```{r}
+ggplot(rcvs_2021_final[Q31 != 3, ], aes(x = Q31, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap(~crime_type)
+```
+
+Среди тех, кто сопротивлялся преступнику, пропорция повторяющихся жертв выше и для нападения, и для разбоя/грабежа.
+
+
+
+```{r}
+chisq.test(rcvs_2021_final[Q31 != 3, ]$is_repeat_victim, rcvs_2021_final[Q31 != 3, ]$Q31)$expected
+chisq.test(rcvs_2021_final[Q31 != 3 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q31 != 3 & crime_is_assault == 1, ]$Q31)$expected
+chisq.test(rcvs_2021_final[Q31 != 3 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q31 != 3 & crime_is_burglary == 1, ]$Q31)$expected
+```
+
+Все ок. Но в попарном сравнении для грабежа/разбоя около 10, что на границе для парных ячеек.
+
+```{r}
+chisq.test(rcvs_2021_final[Q31 != 3, ]$is_repeat_victim, rcvs_2021_final[Q31 != 3, ]$Q31)$p.value
+chisq.test(rcvs_2021_final[Q31 != 3 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q31 != 3 & crime_is_assault == 1, ]$Q31)$p.value
+chisq.test(rcvs_2021_final[Q31 != 3 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q31 != 3 & crime_is_burglary == 1, ]$Q31)$p.value
+fisher.test(rcvs_2021_final[Q31 != 3 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q31 != 3 & crime_is_burglary == 1, ]$Q31)$p.value
+```
+
+Значимо для преступлений в целом и нападений.
+
+
+```{r}
+chisq.test(rcvs_2021_final[Q31 != 3, ]$is_repeat_victim, rcvs_2021_final[Q31 != 3, ]$Q31)$stdres
+chisq.test(rcvs_2021_final[Q31 != 3 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q31 != 3 & crime_is_assault == 1, ]$Q31)$stdres
+```
+
+
+
+## Действовал ли злоумышленник один
+
+Q7 Злоумышленник был один? 1: Один 2: Несколько
+```{r}
+ggplot(rcvs_2021_final[Q7 != 3, ], aes(x = Q7, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Чуть больше жертв повторяющихся среди жертв преступников-одиночек.
+
+```{r}
+ggplot(rcvs_2021_final[Q7 != 3, ], aes(x = Q7, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap(~crime_type)
+```
+
+Чуть больше жертв повторяющихся среди жертв грабителей/разбойников-одиночек.
+
+
+```{r}
+chisq.test(rcvs_2021_final[Q7 != 3, ]$is_repeat_victim, rcvs_2021_final[Q7 != 3, ]$Q7)$expected
+chisq.test(rcvs_2021_final[Q7 != 3 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q7 != 3 & crime_is_assault == 1, ]$Q7)$expected
+chisq.test(rcvs_2021_final[Q7 != 3 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q7 != 3 & crime_is_burglary == 1, ]$Q7)$expected
+```
+
+Все ок. 
+
+```{r}
+chisq.test(rcvs_2021_final[Q7 != 3, ]$is_repeat_victim, rcvs_2021_final[Q7 != 3, ]$Q7)$p.value
+chisq.test(rcvs_2021_final[Q7 != 3 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q7 != 3 & crime_is_assault == 1, ]$Q7)$p.value
+chisq.test(rcvs_2021_final[Q7 != 3 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q7 != 3 & crime_is_burglary == 1, ]$Q7)$p.value
+```
+
+Нет значимого эффекта.
+
+
+
+## Привлекалась ли жертва к уголовной ответственности
+
+Q65 Привлекались ли Вы сами когда-нибудь к уголовной ответственности? 1: Да, 2: Нет
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = Q65, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Среди жертв, которые привлекались к уголовной ответственности, выше доля повторяющихся жертв.
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = Q65, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap(~crime_type)
+```
+
+Среди жертв нападений и хищений, которые привлекались к уголовной ответственности, выше доля повторяющихся жертв. 
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0, ]$Q65)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$Q65)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$Q65)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$Q65)$expected
+```
+
+Для открытого хищения допущение об ожидаемых значениях нарушено.
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0, ]$Q65)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$Q65)$p.value
+fisher.test(rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$Q65)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$Q65)$p.value
+```
+
+Есть значимый эффект для краж.
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$Q65)$stdres
+
+```
+
+
+
+## Пол
+
+Q1 Пол 1: Женский 2: Мужской
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = Q1, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Среди жертв-мужчин выше доля повторяющихся жертв, чем среди жертв-женщин.
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = Q1, fill = is_repeat_victim))+
+  geom_bar (position = "fill") +
+facet_wrap(~crime_type)
+```
+
+Среди жертв-мужчин относительно жертв-женщин выше доля мужчин для нападений и краж, но меньше для грабежа/разбоя.
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0, ]$Q1)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$Q1)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$Q1)$expected
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$Q1)$expected
+```
+Все ок.
+
+
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0, ]$Q1)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ]$Q1)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ]$Q1)$p.value
+chisq.test(rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ]$Q1)$p.value
+```
+
+Значимый эффект только для преступлений в целом.
+
+```{r}
+chisq.test(rcvs_2021_final[Q75_1N > 0, ]$is_repeat_victim, rcvs_2021_final[Q75_1N > 0, ]$Q1)$stdres
+```
+
+Видим статистически значимый эффект: Среди жертв-мужчин выше доля повторяющихся жертв, чем среди жертв-женщин.
+
+## Возраст
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = is_repeat_victim, y = Q2))+
+  geom_violin()
+
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = is_repeat_victim, y = Q2))+
+  geom_boxplot()
+```
+
+Медианный возраст ниже и стенки виолончели на малых возрастах шире для повторяющихся жертв.
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = is_repeat_victim, y = Q2))+
+  geom_violin() +
+  facet_wrap(~crime_type)
+```
+
+Возраст повторяющихся жертв нападений тяготеет к уменьшению. Возраст повторящихся жертв грабежа/разбоя распределен как преступность в целом. Для неповторяющихся жертв скорее всего мало наблюдений.
+
+
+Проверим, требуется ли поправка Уэлша.
+```{r}
+var.test(Q2 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0, ])
+var.test(Q2 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ])
+var.test(Q2 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ])
+var.test(Q2 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_theft== 1, ])
+```
+
+Поправка требуется для нападения.
+
+
+```{r}
+t.test(Q2 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0, ], var.equal = T)
+t.test(Q2 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ], var.equal = F)
+t.test(Q2 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ], var.equal = T)
+t.test(Q2 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ], var.equal = T)
+```
+
+Видим статистически значимые эффекты: повторяющиеся жертвы преступлений в целом как правило младше, однако для жертв грабежей связь обратная со значительно большим размером эффекта.
+
+
+## Доход
+
+Q57 Как бы вы определили свой уровень дохода? 
+1: Едва сводим концы с концами, денег не хватает на продукты
+2: На продукты хватает, на одежду нет
+3: На продукты и одежду хватает, на технику и мебель нет
+4: На технику и мебель хватает, на большее денег нет
+5: Можем позволить автомобиль, но квартиру или
+дачу нет
+6: Можем позволить себе практически все: квартиру и т.д.
+
+
+
+```{r}
+hist(rcvs_2021_final[Q75_1N > 0, ]$Q57)
+```
+
+Распределение не является совершенно нормальным, но оставим numeric с учетом относительной равномерности "шагов".
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = Q57, fill = is_repeat_victim))+
+  geom_bar(position = "fill")
+```
+
+Интересная выгнутая дуга, хотя в целом эффект не заметен был бы.
+
+
+```{r}
+ggplot(rcvs_2021_final[Q75_1N > 0, ], aes(x = Q57, fill = is_repeat_victim))+
+  geom_bar(position = "fill") +
+  facet_wrap(~crime_type)
+```
+
+Повторяющимися жертвами нападения становятся либо умеренно, либо предельно обеспеченные, краж - преимущественно очень бедные, грабежей - преимущественно не самые богатые.
+
+
+```{r}
+var.test(Q57 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0, ])
+var.test(Q57 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ])
+var.test(Q57 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ])
+var.test(Q57 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_theft== 1, ])
+```
+
+Надо поправку Уэлша на общие расчеты.
+
+```{r}
+t.test(Q57 ~ is_repeat_victim, data = rcvs_2021_final, var.equal = F)
+t.test(Q57 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_assault == 1, ], var.equal = T)
+t.test(Q57 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_burglary == 1, ], var.equal = T)
+t.test(Q57 ~ is_repeat_victim, data = rcvs_2021_final[Q75_1N > 0 & crime_is_theft == 1, ], var.equal = T)
+```
+Наблюдаем значимые эффекты для преступлений в целом и для краж: в них средний самооценивый доход повторяющихся жертв в среднем ниже.
