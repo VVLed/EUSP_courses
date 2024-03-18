@@ -1,3 +1,8 @@
+### 
+# A bit boring final project on Victimology course.
+# Just meticulous descriptive analysis of primarily categorical data.
+# We analyse if Russian repeated victims have any traits which contradict to the current literature. 
+# Data: RCVS 2021 
 ---
 output: 
     html_document:
@@ -18,10 +23,7 @@ library(naniar)
 library(ggplot2)
 library(gmodels)
 ```
-Переформулировать, кто бы написал?
-Близкий ли преступник?
-Работает ли?
-Место преступления?
+
 
 
 
